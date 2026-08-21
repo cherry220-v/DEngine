@@ -1,0 +1,17 @@
+{
+  "name": "dengine",
+  "version-string": "0.1.0",
+  "builtin-baseline": "61d43ee6f0cc440dc97983d36e0c85e80fe429d4",
+  "dependencies": [
+    "spdlog",
+    "glad",
+    "glm",
+    "glfw3",
+    "stb",
+    "tinyobjloader",
+    "tinygltf",
+    "opengl",
+    "nlohmann-json",
+    "physx"
+  ]
+}

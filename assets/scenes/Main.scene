@@ -1,0 +1,265 @@
+{
+  "entities": [
+    {
+      "components": {
+        "HierarchyComponent": {
+          "parent": "1830c34d-a1b5-4d27-bc6b-52fa17dba041"
+        },
+        "LightComponent": {
+          "color": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "direction": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "flicker": false,
+          "flickerAmount": 0.20000000298023224,
+          "flickerSpeed": 10.0,
+          "innerAngle": 20.0,
+          "intensity": 0.800000011920929,
+          "outerAngle": 30.0,
+          "range": 10.0,
+          "type": 1
+        },
+        "NameComponent": {
+          "name": "Light"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "id": "754b21f2-338b-46b4-96fa-d6123a22465b"
+    },
+    {
+      "components": {
+        "HierarchyComponent": {
+          "parent": ""
+        },
+        "NameComponent": {
+          "name": "Particle"
+        },
+        "ParticleEmitterComponent": {
+          "acceleration": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "active": true,
+          "direction": [
+            0.0,
+            -1.0,
+            0.0
+          ],
+          "duration": 0.0,
+          "endColor": [
+            1.0,
+            1.0,
+            1.0,
+            0.0
+          ],
+          "loop": true,
+          "material": "ecd38f9f-e145-46d4-a968-d255ec31b3f7",
+          "maxParticles": 1000,
+          "particleLifetime": 2.0,
+          "playOnStart": true,
+          "sizeMax": 0.30000001192092896,
+          "sizeMin": 0.10000000149011612,
+          "spawnBoxMax": [
+            5.0,
+            2.0,
+            5.0
+          ],
+          "spawnBoxMin": [
+            -5.0,
+            0.0,
+            -5.0
+          ],
+          "spawnHeight": 4.0,
+          "spawnRadius": 2.0,
+          "spawnRate": 5.0,
+          "spawnShape": 1,
+          "speedMax": 3.0,
+          "speedMin": 1.0,
+          "spread": 0.20000000298023224,
+          "startColor": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "useColorOverLifetime": true
+        },
+        "Transform": {
+          "position": [
+            1.0,
+            -1.0,
+            0.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "id": "2441a335-6039-4cdf-97fc-66ea3bc37488"
+    },
+    {
+      "components": {
+        "HierarchyComponent": {
+          "parent": ""
+        },
+        "ModelRendererComponent": {
+          "material": "71e469e7-932d-47f1-96e4-94b341ad77f9",
+          "model": "7fe983de-f5b4-447e-8226-042f4a6a704a"
+        },
+        "NameComponent": {
+          "name": "Model"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            -3.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            4.0,
+            4.0,
+            4.0
+          ]
+        }
+      },
+      "id": "d058f7f5-3ec6-4784-aa72-54d7aa5c4914"
+    },
+    {
+      "components": {
+        "HierarchyComponent": {
+          "parent": ""
+        },
+        "ModelRendererComponent": {
+          "material": "71e469e7-932d-47f1-96e4-94b341ad77f9",
+          "model": "3996a039-1488-4465-a16d-d186407e3478"
+        },
+        "NameComponent": {
+          "name": "Model 2"
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "id": "ffb39bf7-9283-478c-8524-28b981cfbcbc"
+    },
+    {
+      "components": {
+        "HierarchyComponent": {
+          "parent": ""
+        },
+        "NameComponent": {
+          "name": "Player"
+        },
+        "PlayerComponent": {
+          "camera": "201ebb89-2afe-4127-b045-3fd9d9d91784",
+          "moveSpeed": 1.0,
+          "pitch": 0.0,
+          "sensitivity": 0.10000000149011612,
+          "shiftSpeed": 2.5,
+          "yaw": -90.0
+        },
+        "Transform": {
+          "position": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "id": "1830c34d-a1b5-4d27-bc6b-52fa17dba041"
+    },
+    {
+      "components": {
+        "CameraComponent": {
+          "farPlane": 1010.0,
+          "fov": 1160.0,
+          "isOrtho": false,
+          "nearPlane": 0.10000000149011612
+        },
+        "HierarchyComponent": {
+          "parent": "1830c34d-a1b5-4d27-bc6b-52fa17dba041"
+        },
+        "NameComponent": {
+          "name": "Camera"
+        },
+        "Transform": {
+          "position": [
+            10.0,
+            0.0,
+            -15.0
+          ],
+          "rotation": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": [
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "id": "201ebb89-2afe-4127-b045-3fd9d9d91784"
+    }
+  ]
+}

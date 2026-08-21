@@ -1,0 +1,13 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/">
+    <file>hierarchy/cube.svg</file>
+    <file>hierarchy/eye.svg</file>
+    <file>hierarchy/eye-closed.svg</file>
+    <file>hierarchy/lock.svg</file>
+    <file>hierarchy/lock-unlocked.svg</file>
+    <file>hierarchy/trash.svg</file>
+</qresource>
+<qresource prefix="fonts/">
+	<file>fonts/RobotoMono-Medium.ttf</file>		
+</qresource>
+</RCC>
