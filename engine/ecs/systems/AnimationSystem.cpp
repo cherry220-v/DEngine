@@ -6,6 +6,11 @@
 #include "../components/AnimatorComponent.hpp"
 #include "../components/SkeletonComponent.hpp"
 
+void AnimationSystem::init(EngineContext* context)
+{
+    (void)context;
+}
+
 void AnimationSystem::update(Scene& scene, float dt)
 {
     auto view =

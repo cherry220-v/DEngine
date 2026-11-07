@@ -94,8 +94,8 @@ add_library(engine STATIC
  "ecs/systems/CameraSystem.hpp"
  "ecs/systems/CameraSystem.cpp"
  "ecs/systems/ISystem.hpp" "ecs/ComponentPool.hpp" "ecs/IComponentPool.hpp" "render/renderer/passes/IRenderPass.hpp" "render/renderer/passes/ShadowPass.cpp" "render/renderer/passes/ScenePass.cpp" "render/renderer/passes/SelectPass.cpp" "render/renderer/passes/WirePass.cpp" "render/renderer/IRenderDevice.hpp" "render/renderer/Renderer.cpp" "render/renderer/gl/OpenGLRenderDevice.cpp" "scene/particles/EffectManager.cpp" "math/Random.h" "render/renderer/passes/ParticlePass.cpp" "ecs/registry/ComponentRegistry.cpp" "ecs/registry/PropertyMeta.cpp" "ecs/systems/ParticleSystem.cpp" "ecs/systems/LightSystem.cpp" "render/renderer/passes/LightPass.cpp" "render/renderer/gpu/GPULight.cpp" "math/ShadowMath.h" "ecs/systems/AnimationSystem.cpp" "math/VertexKey.h" "models/loaders/OBJLoader.cpp" "models/loaders/GLBLoader.cpp" "assets/AssetMeta.cpp" "assets/AssetRegistry.cpp" "render/shader/loaders/ShaderLoader.cpp" "render/texture/loaders/MaterialLoader.cpp" "render/texture/loaders/TextureLoader.cpp"    "ecs/registry/GizmoRegistry.cpp" "editor/gizmos/TransformGizmo.cpp" "render/renderer/passes/EditorPass.cpp" "editor/EditorDrawList.cpp"
- #editor/gizmo/ImGuizmo.h
- #editor/gizmo/ImGuizmo.cpp
+ "editor/gizmo/ImGuizmo.h"
+ "editor/gizmo/ImGuizmo.cpp"
  "editor/DrawList.cpp" "editor/DrawTypes.h" "core/platform/input/InputSystem.cpp" "core/platform/input/win32/Win32Input.cpp" "core/platform/window/win32/Win32Window.cpp" "core/platform/render/win32/Win32RenderPlatform.cpp" "ecs/systems/SceneGraphSystem.cpp" "ecs/entity/EntityManager.cpp" "models/loaders/tiny_gltf.cpp" "render/texture/stb_impl.cpp" "ecs/systems/PhysicsSystem.cpp" "overlay/Gizmo.cpp" "render/renderer/passes/OverlayPass.cpp" "overlay/OverlayMath.hpp" "core/prints.h" "math/PickObject.hpp" "math/PickObject.cpp")
 if (USE_GLFW)
 target_sources(engine PRIVATE
@@ -128,7 +128,7 @@ endif()
 target_link_libraries(engine PUBLIC
     nlohmann_json::nlohmann_json
     spdlog::spdlog
-	glad::glad
+        glad::glad
     glm::glm
     glfw
     stb

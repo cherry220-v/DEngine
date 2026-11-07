@@ -130,14 +130,14 @@ void Engine::setupRenderer()
     shadowPass->after(*lightPass);
     scenePass->after(*shadowPass);
     particlePass->after(*scenePass);
-    //selectPass->after(*scenePass);
+    selectPass->after(*scenePass);
     overlayPass->after(*scenePass);
 
     m_renderer->graph.addPass(std::move(lightPass));
     m_renderer->graph.addPass(std::move(shadowPass));
     m_renderer->graph.addPass(std::move(scenePass));
     m_renderer->graph.addPass(std::move(particlePass));
-    //m_renderer->graph.addPass(std::move(selectPass));
+    m_renderer->graph.addPass(std::move(selectPass));
     m_renderer->graph.addPass(std::move(overlayPass));
 
     m_renderer->init();

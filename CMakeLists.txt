@@ -8,6 +8,6 @@ endif()
 project ("DEngine")
 
 add_subdirectory (engine)
-add_subdirectory (runtime)
+add_subdirectory (runtest)
 add_subdirectory (editor)
 

@@ -54,7 +54,7 @@ void Renderer::beginFrame()
     );
 
     device->clearColor(
-        1.0f,
+        0.1f,
         0.1f,
         0.1f,
         1.0f

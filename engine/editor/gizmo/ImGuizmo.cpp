@@ -1,6 +1,43 @@
+// ImGuizmo port for DEngine (glm / column-major, OpenGL conventions).
+//
+// This is a corrected rewrite of the engine's ImGuizmo port. The original
+// upstream library (see editor/thirdparties/ImGuizmo) uses row-major matrices
+// with row-vector math (p' = p * M). This engine uses glm column-major
+// matrices with column-vector math (p' = M * p). Every matrix composition in
+// the upstream code therefore has to be written in REVERSED order here, and
+// matrix element access stays 1:1 (glm[i][j] == upstream m16[i*4+j]).
+//
+// Changelog of the math fixes applied to this port:
+//   * mViewProjection  : view * proj  -> proj * view
+//   * mMVP / mMVPLocal : model * VP   -> VP * model
+//   * HandleTranslation: result       -> deltaT * modelSource (world delta)
+//   * HandleScale      : result       -> modelLocal * deltaS (local scale)
+//   * HandleRotation   : local result -> model * deltaR * scaleOrigin
+//                        world result -> deltaR * rotPart(modelSource)
+//                        deltaMatrix  -> model * deltaR * modelInverse
+//   * LocalBounds      : result       -> boundsMatrix * post * scale * pre
+//   * RecomposeMatrix  : rotZ * rotY * rotX (was rotX * rotY * rotZ)
+//   * DrawCubes / DrawGridCustom: proj * view * model (was view * proj ...)
+//   * ComputeFrustumPlanes: planes are actually normalized now
+//   * ComputeContext   : mModelInverse/mModelSourceInverse no longer clobber
+//                        each other; mbMouseOver is not reset every frame
+//   * GetRotateType    : proper camera-to-model direction, no debug circles
+//   * DrawTranslationGizmo: discarded glm::normalize() + garbage polyline
+//   * Manipulate       : full interaction pipeline restored (it was entirely
+//                        commented out - gizmo could never be dragged)
+//   * snap             : all three components snapped (was X only)
+//   * axis mask        : consistent bit order (bit i == axis i hidden)
+//   * ViewManipulate   : drag-to-rotate restored, correct camera up handling
+//   * removed all std::cout debug spam and dead/UB code
+
 #include "ImGuizmo.h"
 
 #include <vector>
+#include <cstring>
+#include <cmath>
+#include <cassert>
+#include <cfloat>
+
 #include <core/platform/input/IInput.hpp>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -23,30 +60,209 @@ namespace GUIZMO_NAMESPACE
   const float rotationDisplayFactor = 1.2f;
 
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  // utility and math
+  // DrawList primitive helpers.
+  //
+  // The engine's DrawList only provides AddLine/AddRect/AddRectFilled/AddQuad/
+  // AddQuadFilled/AddText. The gizmo needs polylines, circles, discs and convex
+  // polygons - none of which exist anywhere in the project (this is why the
+  // port never linked). These helpers implement the missing primitives on top
+  // of the public DrawList API without touching engine files.
 
-  void FPU_MatrixF_x_MatrixF(const float* a, const float* b, float* r)
+  static void GuiApplyState(DrawList* dl)
   {
-     r[0] = a[0] * b[0] + a[1] * b[4] + a[2] * b[8] + a[3] * b[12];
-     r[1] = a[0] * b[1] + a[1] * b[5] + a[2] * b[9] + a[3] * b[13];
-     r[2] = a[0] * b[2] + a[1] * b[6] + a[2] * b[10] + a[3] * b[14];
-     r[3] = a[0] * b[3] + a[1] * b[7] + a[2] * b[11] + a[3] * b[15];
+     if (!dl)
+     {
+        return;
+     }
 
-     r[4] = a[4] * b[0] + a[5] * b[4] + a[6] * b[8] + a[7] * b[12];
-     r[5] = a[4] * b[1] + a[5] * b[5] + a[6] * b[9] + a[7] * b[13];
-     r[6] = a[4] * b[2] + a[5] * b[6] + a[6] * b[10] + a[7] * b[14];
-     r[7] = a[4] * b[3] + a[5] * b[7] + a[6] * b[11] + a[7] * b[15];
+     if (dl->cmdBuffer.empty())
+     {
+        DrawCmd cmd;
+        cmd.elemCount = 0;
+        cmd.idxOffset = 0;
+        cmd.vtxOffset = 0;
+        cmd.textureId = dl->_state.textureId;
+        cmd.clipRect = dl->_state.clipRect;
+        cmd.space = dl->_state.space;
+        cmd.sortKey = dl->_state.sortKey;
+        cmd.depthTest = dl->_state.depthTest;
+        cmd.writeDepth = dl->_state.writeDepth;
+        cmd.pickable = dl->_state.pickable;
+        dl->cmdBuffer.push_back(cmd);
+        return;
+     }
 
-     r[8] = a[8] * b[0] + a[9] * b[4] + a[10] * b[8] + a[11] * b[12];
-     r[9] = a[8] * b[1] + a[9] * b[5] + a[10] * b[9] + a[11] * b[13];
-     r[10] = a[8] * b[2] + a[9] * b[6] + a[10] * b[10] + a[11] * b[14];
-     r[11] = a[8] * b[3] + a[9] * b[7] + a[10] * b[11] + a[11] * b[15];
+     DrawCmd& cmd = dl->cmdBuffer.back();
 
-     r[12] = a[12] * b[0] + a[13] * b[4] + a[14] * b[8] + a[15] * b[12];
-     r[13] = a[12] * b[1] + a[13] * b[5] + a[14] * b[9] + a[15] * b[13];
-     r[14] = a[12] * b[2] + a[13] * b[6] + a[14] * b[10] + a[15] * b[14];
-     r[15] = a[12] * b[3] + a[13] * b[7] + a[14] * b[11] + a[15] * b[15];
+     const bool stateMismatch =
+        cmd.textureId != dl->_state.textureId ||
+        cmd.clipRect.Min != dl->_state.clipRect.Min ||
+        cmd.clipRect.Max != dl->_state.clipRect.Max ||
+        cmd.space != dl->_state.space;
+
+     if (cmd.elemCount > 0 && stateMismatch)
+     {
+        DrawCmd newCmd;
+        newCmd.elemCount = 0;
+        newCmd.idxOffset = (uint32_t)dl->idxBuffer.size();
+        newCmd.vtxOffset = (uint32_t)dl->vtxBuffer.size();
+        newCmd.textureId = dl->_state.textureId;
+        newCmd.clipRect = dl->_state.clipRect;
+        newCmd.space = dl->_state.space;
+        newCmd.sortKey = dl->_state.sortKey;
+        newCmd.depthTest = dl->_state.depthTest;
+        newCmd.writeDepth = dl->_state.writeDepth;
+        newCmd.pickable = dl->_state.pickable;
+        dl->cmdBuffer.push_back(newCmd);
+     }
+     else if (cmd.elemCount == 0)
+     {
+        cmd.textureId = dl->_state.textureId;
+        cmd.clipRect = dl->_state.clipRect;
+        cmd.space = dl->_state.space;
+        cmd.sortKey = dl->_state.sortKey;
+        cmd.depthTest = dl->_state.depthTest;
+        cmd.writeDepth = dl->_state.writeDepth;
+        cmd.pickable = dl->_state.pickable;
+     }
   }
+
+  static void GuiAddPolyline(DrawList* dl, const glm::vec2* points, int count, U32 col, float thickness, DrawFlags flags)
+  {
+     if (!dl || !points || count < 2 || thickness <= 0.0f || (col & 0xFF000000u) == 0)
+     {
+        return;
+     }
+
+     GuiApplyState(dl);
+
+     for (int i = 0; i < count - 1; i++)
+     {
+        dl->AddLine(points[i], points[i + 1], col, thickness);
+     }
+
+     if (flags & DrawFlags_Closed)
+     {
+        dl->AddLine(points[count - 1], points[0], col, thickness);
+     }
+  }
+
+  static void GuiAddCircle(DrawList* dl, const glm::vec2& center, float radius, U32 col, int numSegments, float thickness)
+  {
+     if (!dl || radius <= 0.0f || thickness <= 0.0f || (col & 0xFF000000u) == 0)
+     {
+        return;
+     }
+
+     numSegments = (numSegments > 0) ? numSegments : 12;
+     numSegments = (numSegments > 108) ? 108 : numSegments;
+
+     glm::vec2 points[109];
+     const float dAngle = (2.0f * ZPI) / (float)numSegments;
+     for (int i = 0; i < numSegments; i++)
+     {
+        const float a = (float)i * dAngle;
+        points[i] = center + glm::vec2(cosf(a), sinf(a)) * radius;
+     }
+
+     GuiAddPolyline(dl, points, numSegments, col, thickness, DrawFlags_Closed);
+  }
+
+  static void GuiAddCircleFilled(DrawList* dl, const glm::vec2& center, float radius, U32 col, int numSegments)
+  {
+     if (!dl || radius <= 0.0f || (col & 0xFF000000u) == 0)
+     {
+        return;
+     }
+
+     numSegments = (numSegments > 2) ? numSegments : 12;
+     numSegments = (numSegments > 108) ? 108 : numSegments;
+
+     GuiApplyState(dl);
+
+     dl->PrimReserve((uint32_t)numSegments * 3, (uint32_t)numSegments + 1);
+     const DrawIdx base = dl->_VtxCurrentIdx;
+
+     dl->PrimWriteVtx(center, { 0.f, 0.f }, col);
+     for (int i = 0; i < numSegments; i++)
+     {
+        const float a = (2.0f * ZPI) * ((float)i / (float)numSegments);
+        dl->PrimWriteVtx(center + glm::vec2(cosf(a), sinf(a)) * radius, { 0.f, 0.f }, col);
+     }
+
+     for (int i = 0; i < numSegments; i++)
+     {
+        dl->PrimWriteIdx(base);
+        dl->PrimWriteIdx(base + 1 + (DrawIdx)i);
+        dl->PrimWriteIdx(base + 1 + (DrawIdx)((i + 1) % numSegments));
+     }
+  }
+
+  static void GuiAddTriangleFilled(DrawList* dl, const glm::vec2& a, const glm::vec2& b, const glm::vec2& c, U32 col)
+  {
+     if (!dl || (col & 0xFF000000u) == 0)
+     {
+        return;
+     }
+
+     GuiApplyState(dl);
+
+     dl->PrimReserve(3, 3);
+     const DrawIdx base = dl->_VtxCurrentIdx;
+
+     dl->PrimWriteVtx(a, { 0.f, 0.f }, col);
+     dl->PrimWriteVtx(b, { 0.f, 0.f }, col);
+     dl->PrimWriteVtx(c, { 0.f, 0.f }, col);
+
+     dl->PrimWriteIdx(base + 0);
+     dl->PrimWriteIdx(base + 1);
+     dl->PrimWriteIdx(base + 2);
+  }
+
+  static void GuiAddConvexPolyFilled(DrawList* dl, const glm::vec2* points, int count, U32 col)
+  {
+     if (!dl || !points || count < 3 || (col & 0xFF000000u) == 0)
+     {
+        return;
+     }
+
+     GuiApplyState(dl);
+
+     const int triCount = count - 2;
+     dl->PrimReserve((uint32_t)triCount * 3, (uint32_t)count);
+     const DrawIdx base = dl->_VtxCurrentIdx;
+
+     for (int i = 0; i < count; i++)
+     {
+        dl->PrimWriteVtx(points[i], { 0.f, 0.f }, col);
+     }
+
+     for (int i = 0; i < triCount; i++)
+     {
+        dl->PrimWriteIdx(base);
+        dl->PrimWriteIdx(base + 1 + (DrawIdx)i);
+        dl->PrimWriteIdx(base + 2 + (DrawIdx)i);
+     }
+  }
+
+  // Returns false when any projected point fell behind the camera (worldToPos
+  // returns the (-FLT_MAX,-FLT_MAX) sentinel for those). Drawing huge polygons
+  // with such points produces full-screen garbage flashes.
+  static bool GuiPointsValid(const glm::vec2* points, int count)
+  {
+     for (int i = 0; i < count; i++)
+     {
+        if (points[i].x <= -1e30f || points[i].y <= -1e30f ||
+            points[i].x >= 1e30f || points[i].y >= 1e30f)
+        {
+           return false;
+        }
+     }
+     return true;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // utility and math
 
   void Frustum(float left, float right, float bottom, float top, float znear, float zfar, float* m16, bool rightHanded = true)
   {
@@ -102,6 +318,7 @@ namespace GUIZMO_NAMESPACE
      r[2] = a[2] * il;
   }
 
+  // Writes a glm (column-major) view matrix.
   void LookAt(const float* eye, const float* at, const float* up, float* m16, bool rightHanded = true)
   {
      float X[3], Y[3], Z[3], tmp[3];
@@ -125,6 +342,11 @@ namespace GUIZMO_NAMESPACE
      Cross(Z, X, tmp);
      Normalize(tmp, Y);
 
+     // Layout note: the axis vectors are written "column-wise" exactly like
+     // upstream (m16[0]=X.x, m16[1]=Y.x, m16[2]=Z.x, m16[4]=X.y, ...). This
+     // looks transposed, but in glm's column-major memory it puts X/Y/Z into
+     // the ROWS of the matrix - which is exactly what a glm view matrix needs
+     // (V * eye == origin). Verified by unit test.
      m16[0] = X[0];
      m16[1] = Y[0];
      m16[2] = Z[0];
@@ -143,13 +365,11 @@ namespace GUIZMO_NAMESPACE
      m16[15] = 1.0f;
   }
 
-  template <typename T> T Clamp(T x, T y, T z) { return ((x < y) ? y : ((x > z) ? z : x)); }
-  template <typename T> T max(T x, T y) { return (x > y) ? x : y; }
-  template <typename T> T min(T x, T y) { return (x < y) ? x : y; }
-  template <typename T> bool IsWithin(T x, T y, T z) { return (x >= y) && (x <= z); }
-
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //
+
+  template <typename T> T Clamp(T x, T y, T z) { return ((x < y) ? y : ((x > z) ? z : x)); }
+  template <typename T> bool IsWithin(T x, T y, T z) { return (x >= y) && (x <= z); }
 
   static bool IsTranslateType(MOVETYPE type)
   {
@@ -182,36 +402,40 @@ namespace GUIZMO_NAMESPACE
      CenterCircleSize           = 6.0f;
 
      // initialize default colors
-     Colors[DIRECTION_X]           = Float4(0.666f, 0.000f, 0.000f, 1.000f);
-     Colors[DIRECTION_Y]           = Float4(0.000f, 0.666f, 0.000f, 1.000f);
-     Colors[DIRECTION_Z]           = Float4(0.000f, 0.000f, 0.666f, 1.000f);
-     Colors[PLANE_X]               = Float4(0.666f, 0.000f, 0.000f, 0.380f);
-     Colors[PLANE_Y]               = Float4(0.000f, 0.666f, 0.000f, 0.380f);
-     Colors[PLANE_Z]               = Float4(0.000f, 0.000f, 0.666f, 0.380f);
-     Colors[SELECTION]             = Float4(1.000f, 0.500f, 0.062f, 0.541f);
-     Colors[INACTIVE]              = Float4(0.600f, 0.600f, 0.600f, 0.600f);
-     Colors[TRANSLATION_LINE]      = Float4(0.666f, 0.666f, 0.666f, 0.666f);
-     Colors[SCALE_LINE]            = Float4(0.250f, 0.250f, 0.250f, 1.000f);
-     Colors[ROTATION_USING_BORDER] = Float4(1.000f, 0.500f, 0.062f, 1.000f);
-     Colors[ROTATION_USING_FILL]   = Float4(1.000f, 0.500f, 0.062f, 0.500f);
-     Colors[HATCHED_AXIS_LINES]    = Float4(0.000f, 0.000f, 0.000f, 0.500f);
-     Colors[TEXT]                  = Float4(1.000f, 1.000f, 1.000f, 1.000f);
-     Colors[TEXT_SHADOW]           = Float4(0.000f, 0.000f, 0.000f, 1.000f);
+     Colors[DIRECTION_X]           = Float4{ 0.666f, 0.000f, 0.000f, 1.000f };
+     Colors[DIRECTION_Y]           = Float4{ 0.000f, 0.666f, 0.000f, 1.000f };
+     Colors[DIRECTION_Z]           = Float4{ 0.000f, 0.000f, 0.666f, 1.000f };
+     Colors[PLANE_X]               = Float4{ 0.666f, 0.000f, 0.000f, 0.380f };
+     Colors[PLANE_Y]               = Float4{ 0.000f, 0.666f, 0.000f, 0.380f };
+     Colors[PLANE_Z]               = Float4{ 0.000f, 0.000f, 0.666f, 0.380f };
+     Colors[SELECTION]             = Float4{ 1.000f, 0.500f, 0.062f, 0.541f };
+     Colors[INACTIVE]              = Float4{ 0.600f, 0.600f, 0.600f, 0.600f };
+     Colors[TRANSLATION_LINE]      = Float4{ 0.666f, 0.666f, 0.666f, 0.666f };
+     Colors[SCALE_LINE]            = Float4{ 0.250f, 0.250f, 0.250f, 1.000f };
+     Colors[ROTATION_USING_BORDER] = Float4{ 1.000f, 0.500f, 0.062f, 1.000f };
+     Colors[ROTATION_USING_FILL]   = Float4{ 1.000f, 0.500f, 0.062f, 0.500f };
+     Colors[HATCHED_AXIS_LINES]    = Float4{ 0.000f, 0.000f, 0.000f, 0.500f };
+     Colors[TEXT]                  = Float4{ 1.000f, 1.000f, 1.000f, 1.000f };
+     Colors[TEXT_SHADOW]           = Float4{ 0.000f, 0.000f, 0.000f, 1.000f };
   }
 
   struct Context
   {
-     Context() : mbUsing(false), mbUsingViewManipulate(false), mbEnable(true), mIsViewManipulatorHovered(false), mbUsingBounds(false)
+     Context()
+        : mViewMat(1.0f), mProjectionMat(1.0f), mModel(1.0f), mModelLocal(1.0f)
+        , mModelInverse(1.0f), mModelSource(1.0f), mModelSourceInverse(1.0f)
+        , mMVP(1.0f), mMVPLocal(1.0f), mViewProjection(1.0f)
+        , mbUsing(false), mbUsingViewManipulate(false), mbEnable(true), mIsViewManipulatorHovered(false), mbUsingBounds(false)
      {
      }
 
-     DrawList* mDrawList;
+     DrawList* mDrawList = nullptr;
      IInput* mInput = nullptr;
      IWindow* mWindow = nullptr;
      IRenderPlatform* mPlatform = nullptr;
      Style mStyle;
 
-     MODE mMode;
+     MODE mMode = LOCAL;
      glm::mat4 mViewMat;
      glm::mat4 mProjectionMat;
      glm::mat4 mModel;
@@ -223,65 +447,64 @@ namespace GUIZMO_NAMESPACE
      glm::mat4 mMVPLocal; // MVP with full model matrix whereas mMVP's model matrix might only be translation in case of World space edition
      glm::mat4 mViewProjection;
 
-     glm::vec4 mModelScaleOrigin;
-     glm::vec4 mCameraEye;
-     glm::vec4 mCameraRight;
-     glm::vec4 mCameraDir;
-     glm::vec4 mCameraUp;
-     glm::vec4 mRayOrigin;
-     glm::vec4 mRayVector;
+     glm::vec4 mModelScaleOrigin{ 1.f, 1.f, 1.f, 0.f };
+     glm::vec4 mCameraEye{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mCameraRight{ 1.f, 0.f, 0.f, 0.f };
+     glm::vec4 mCameraDir{ 0.f, 0.f, -1.f, 0.f };
+     glm::vec4 mCameraUp{ 0.f, 1.f, 0.f, 0.f };
+     glm::vec4 mRayOrigin{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mRayVector{ 0.f, 0.f, -1.f, 0.f };
 
-     float  mRadiusSquareCenter;
-     glm::vec2 mScreenSquareCenter;
-     glm::vec2 mScreenSquareMin;
-     glm::vec2 mScreenSquareMax;
+     float  mRadiusSquareCenter = 0.f;
+     glm::vec2 mScreenSquareCenter{ 0.f, 0.f };
+     glm::vec2 mScreenSquareMin{ 0.f, 0.f };
+     glm::vec2 mScreenSquareMax{ 0.f, 0.f };
 
-     float mScreenFactor;
-     glm::vec4 mRelativeOrigin;
+     float mScreenFactor = 1.f;
+     glm::vec4 mRelativeOrigin{ 0.f, 0.f, 0.f, 0.f };
 
      bool mbUsing;
      bool mbUsingViewManipulate;
      bool mbEnable;
-     bool mbMouseOver;
-     bool mReversed; // reversed projection matrix
+     bool mbMouseOver = true;
+     bool mReversed = false; // reversed projection matrix
      bool mIsViewManipulatorHovered;
 
      // translation
-     glm::vec4 mTranslationPlan;
-     glm::vec4 mTranslationPlanOrigin;
-     glm::vec4 mMatrixOrigin;
-     glm::vec4 mTranslationLastDelta;
+     glm::vec4 mTranslationPlan{ 0.f, 0.f, 1.f, 0.f };
+     glm::vec4 mTranslationPlanOrigin{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mMatrixOrigin{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mTranslationLastDelta{ 0.f, 0.f, 0.f, 0.f };
 
      // rotation
-     glm::vec4 mRotationVectorSource;
-     float mRotationAngle;
-     float mRotationAngleOrigin;
-     //glm::vec4 mWorldToLocalAxis;
+     glm::vec4 mRotationVectorSource{ 0.f, 0.f, 1.f, 0.f };
+     float mRotationAngle = 0.f;
+     float mRotationAngleOrigin = 0.f;
 
      // scale
-     glm::vec4 mScale;
-     glm::vec4 mScaleValueOrigin;
-     glm::vec4 mScaleLast;
-     float mSaveMousePosx;
+     glm::vec4 mScale{ 1.f, 1.f, 1.f, 0.f };
+     glm::vec4 mScaleValueOrigin{ 1.f, 1.f, 1.f, 0.f };
+     glm::vec4 mScaleLast{ 1.f, 1.f, 1.f, 0.f };
+     float mSaveMousePosx = 0.f;
 
      // save axis factor when using gizmo
-     bool mBelowAxisLit[3];
+     bool mBelowAxisLit[3] = { true, true, true };
      int mAxisMask = 0;
-     bool mBelowPlaneLit[3];
-     float mAxisFactor[3];
+     bool mBelowPlaneLit[3] = { true, true, true };
+     float mAxisFactor[3] = { 1.f, 1.f, 1.f };
 
-     float mAxisLit=0.0025f;
-     float mPlaneLit=0.02f;
+     float mAxisLit = 0.0025f;
+     float mPlaneLit = 0.02f;
 
      // bounds stretching
-     glm::vec4 mBoundsPivot;
-     glm::vec4 mBoundsAnchor;
-     glm::vec4 mBoundsPlan;
-     glm::vec4 mBoundsLocalPivot;
-     int mBoundsBestAxis;
-     int mBoundsAxis[2];
+     glm::vec4 mBoundsPivot{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mBoundsAnchor{ 0.f, 0.f, 0.f, 1.f };
+     glm::vec4 mBoundsPlan{ 0.f, 0.f, 1.f, 0.f };
+     glm::vec4 mBoundsLocalPivot{ 0.f, 0.f, 0.f, 0.f };
+     int mBoundsBestAxis = 0;
+     int mBoundsAxis[2] = { 0, 1 };
      bool mbUsingBounds;
-     glm::mat4 mBoundsMatrix;
+     glm::mat4 mBoundsMatrix{ 1.0f };
 
      //
      MOVETYPE mCurrentHandleType = MT_NONE;
@@ -296,12 +519,12 @@ namespace GUIZMO_NAMESPACE
      float mDisplayRatio = 1.f;
 
      bool mIsOrthographic = false;
-     // check to not have multiple gizmo highlighted at the same te
+     // check to not have multiple gizmo highlighted at the same time
      bool mbOverGizmoHotspot = false;
 
      GuiWindow* mAlternativeWindow = nullptr;
      std::vector<WidgetID> mIDStack;
-     WidgetID mEditingID = -1;
+     WidgetID mEditingID = (WidgetID)-1;
      OPERATION mOperation = OPERATION(0);
 
      bool mAllowAxisFlip = true;
@@ -311,7 +534,7 @@ namespace GUIZMO_NAMESPACE
      {
         if (mIDStack.empty())
         {
-           mIDStack.push_back(-1);
+           mIDStack.push_back((WidgetID)-1);
         }
         return mIDStack.back();
      }
@@ -361,7 +584,7 @@ namespace GUIZMO_NAMESPACE
       return glm::vec2(trans.x, trans.y);
   }
 
-
+  // mouse ray from camera matrices - glm column-major, correct order (proj * view)
   static void ComputeCameraRay(glm::vec4& rayOrigin, glm::vec4& rayDir, glm::vec2 position = glm::vec2(gContext.mX, gContext.mY), glm::vec2 size = glm::vec2(gContext.mWidth, gContext.mHeight))
   {
       IInput* input = gContext.mInput;
@@ -370,7 +593,7 @@ namespace GUIZMO_NAMESPACE
       double mouseX, mouseY;
       input->getMousePosition(mouseX, mouseY);
 
-      glm::mat4 viewProj = glm::mat4(gContext.mProjectionMat) * glm::mat4(gContext.mViewMat);
+      glm::mat4 viewProj = gContext.mProjectionMat * gContext.mViewMat;
       glm::mat4 mViewProjInverse = glm::inverse(viewProj);
 
       const float mox = ((static_cast<float>(mouseX) - position.x) / size.x) * 2.f - 1.f;
@@ -383,13 +606,21 @@ namespace GUIZMO_NAMESPACE
       glm::vec4 endNDC = glm::vec4(mox, moy, zFar, 1.f);
 
       glm::vec4 startWorld = mViewProjInverse * startNDC;
-      startWorld /= startWorld.w;
+      if (fabsf(startWorld.w) > FLT_EPSILON)
+      {
+          startWorld /= startWorld.w;
+      }
       rayOrigin = startWorld;
 
       glm::vec4 endWorld = mViewProjInverse * endNDC;
-      endWorld /= endWorld.w;
+      if (fabsf(endWorld.w) > FLT_EPSILON)
+      {
+          endWorld /= endWorld.w;
+      }
 
-      rayDir = glm::vec4(glm::normalize(glm::vec3(endWorld) - glm::vec3(startWorld)), 0.f);
+      glm::vec3 dir = glm::vec3(endWorld) - glm::vec3(startWorld);
+      const float dirLen = glm::length(dir);
+      rayDir = glm::vec4((dirLen > FLT_EPSILON) ? dir / dirLen : glm::vec3(0.f, 0.f, -1.f), 0.f);
   }
 
   void DrawTransformAxes(DrawList* drawList, const glm::mat4& view, const glm::mat4& projection, const glm::mat4& transform)
@@ -397,7 +628,11 @@ namespace GUIZMO_NAMESPACE
       if (!drawList) return;
 
       if (drawList->cmdBuffer.empty()) {
-          DrawCmd initCmd{ 0, 0, Rect(glm::vec2(0, 0), glm::vec2(gContext.mWidth, gContext.mHeight)) };
+          DrawCmd initCmd;
+          initCmd.elemCount = 0;
+          initCmd.idxOffset = 0;
+          initCmd.vtxOffset = 0;
+          initCmd.clipRect = Rect(glm::vec2(0, 0), glm::vec2(gContext.mWidth, gContext.mHeight));
           drawList->cmdBuffer.push_back(initCmd);
       }
 
@@ -437,33 +672,24 @@ namespace GUIZMO_NAMESPACE
 
               glm::vec2 line[2] = { p0, p1 };
 
-              drawList->AddPolyline(
-                  line,
-                  2,
-                  colors[i],
-                  true,
-                  4.0f
-              );
+              GuiAddPolyline(drawList, line, 2, colors[i], 4.0f, DrawFlags_None);
           }
       }
   }
 
-
   void UpdateContext(const RenderContext& ctx, DrawList& list, IRenderPlatform* platform, IRenderDevice* device)
   {
+      (void)device;
       gContext.mDrawList = static_cast<DrawList*>(&list);
       gContext.mInput = static_cast<IInput*>(ctx.input);
+      gContext.mPlatform = platform;
 
-      glm::vec2 windowSize = glm::vec2(platform->getWidth(), platform->getHeight());
-      glm::vec2 mousePos = ctx.input->getMousePosition();
-
-      if (gContext.mDrawList) {
-          //gContext.mDrawList->BeginFrame(windowSize);
-      }
+      glm::vec2 windowSize = glm::vec2(platform ? (float)platform->getWidth() : 0.f, platform ? (float)platform->getHeight() : 0.f);
+      glm::vec2 mousePos = ctx.input ? ctx.input->getMousePosition() : glm::vec2(-1.f, -1.f);
 
       auto scene = ctx.scene;
-      auto* camTransform = scene->getComponent<Transform>(ctx.activeCamera);
-      auto* camComponent = scene->getComponent<CameraComponent>(ctx.activeCamera);
+      auto* camTransform = scene ? scene->getComponent<Transform>(ctx.activeCamera) : nullptr;
+      auto* camComponent = scene ? scene->getComponent<CameraComponent>(ctx.activeCamera) : nullptr;
 
       if (!camTransform || !camComponent)
           return;
@@ -474,8 +700,8 @@ namespace GUIZMO_NAMESPACE
       gContext.mX = 0.0f; gContext.mY = 0.0f;
       gContext.mWidth = windowSize.x; gContext.mHeight = windowSize.y;
       gContext.mXMax = windowSize.x; gContext.mYMax = windowSize.y;
-      gContext.mDisplayRatio = windowSize.x / windowSize.y;
-      gContext.mSaveMousePosx = static_cast<float>(mousePos.x);
+      gContext.mDisplayRatio = (windowSize.y > 0.f) ? (windowSize.x / windowSize.y) : 1.f;
+      gContext.mSaveMousePosx = mousePos.x;
       gContext.mbMouseOver = true;
 
       gContext.mViewMat = viewMatrix;
@@ -488,7 +714,7 @@ namespace GUIZMO_NAMESPACE
 
       gContext.mCameraRight = invView[0];
       gContext.mCameraUp = invView[1];
-      gContext.mCameraDir = -invView[2];
+      gContext.mCameraDir = invView[2];
       gContext.mCameraEye = invView[3];
 
       ComputeCameraRay(gContext.mRayOrigin, gContext.mRayVector);
@@ -501,7 +727,7 @@ namespace GUIZMO_NAMESPACE
 
   static U32 GetColorU32(int idx)
   {
-     _ASSERT(idx < COLOR::COUNT);
+     assert(idx < COLOR::COUNT);
      return ColorConvertFloat4ToU32(gContext.mStyle.Colors[idx]);
   }
 
@@ -605,25 +831,9 @@ namespace GUIZMO_NAMESPACE
       return glm::dot(glm::vec3(plan), glm::vec3(point)) + plan.w;
   }
 
-
   static bool IsInContextRect(glm::vec2 p)
   {
       return IsWithin(p.x, gContext.mX, gContext.mXMax) && IsWithin(p.y, gContext.mY, gContext.mYMax);
-  }
-
-  static bool IsHoveringWindow()
-  {
-     //GuiContext& g = *Gui::GetCurrentContext();
-     //GuiWindow* window = Gui::FindWindowByName(gContext.mDrawList->_OwnerName);
-     //if (g.HoveredWindow == window)   // Mouse hovering drawlist window
-     //   return true;
-     //if (gContext.mAlternativeWindow != nullptr && g.HoveredWindow == gContext.mAlternativeWindow)
-     //   return true;
-     //if (g.HoveredWindow != NULL)     // Any other window is hovered
-     //   return false;
-     //if (Gui::IsMouseHoveringRect(window->InnerRect.Min, window->InnerRect.Max, false))   // Hovering drawlist window rect, while no other window is hovered (for _NoInputs windows)
-     //   return true;
-     return false;
   }
 
   void SetRect(float x, float y, float width, float height)
@@ -633,8 +843,8 @@ namespace GUIZMO_NAMESPACE
      gContext.mWidth = width;
      gContext.mHeight = height;
      gContext.mXMax = gContext.mX + gContext.mWidth;
-     gContext.mYMax = gContext.mY + gContext.mXMax;
-     gContext.mDisplayRatio = width / height;
+     gContext.mYMax = gContext.mY + gContext.mHeight;
+     gContext.mDisplayRatio = (height > 0.f) ? (width / height) : 1.f;
   }
 
   void SetOrthographic(bool isOrthographic)
@@ -731,9 +941,7 @@ namespace GUIZMO_NAMESPACE
      gContext.mMode = mode;
      gContext.mViewMat = *(glm::mat4*)view;
      gContext.mProjectionMat = *(glm::mat4*)projection;
-     gContext.mbMouseOver = IsHoveringWindow();
 
-     gContext.mModelLocal = *(glm::mat4*)matrix;
      gContext.mModelLocal = *(glm::mat4*)matrix;
 
      glm::vec3 r = glm::normalize(glm::vec3(gContext.mModelLocal[0]));
@@ -750,8 +958,8 @@ namespace GUIZMO_NAMESPACE
      }
      else
      {
-         gContext.mModel = glm::mat4(1.0f);
-         gContext.mModel[3] = (*(glm::mat4*)matrix)[3];
+        gContext.mModel = glm::mat4(1.0f);
+        gContext.mModel[3] = (*(glm::mat4*)matrix)[3];
      }
 
      gContext.mModelSource = *(glm::mat4*)matrix;
@@ -763,14 +971,16 @@ namespace GUIZMO_NAMESPACE
      );
 
      gContext.mModelInverse = glm::inverse(gContext.mModel);
-     gContext.mModelInverse = glm::inverse(gContext.mModelSource);
+     gContext.mModelSourceInverse = glm::inverse(gContext.mModelSource);
 
-     gContext.mViewProjection = gContext.mViewMat * gContext.mProjectionMat;
-     gContext.mMVP = gContext.mModel * gContext.mViewProjection;
-     gContext.mMVPLocal = gContext.mModelLocal * gContext.mViewProjection;
+     // FIX: glm column-vector convention - projection is applied last, so it
+     // goes on the LEFT. The old code had view * proj and model * VP which
+     // misplaces every gizmo point in clip space.
+     gContext.mViewProjection = gContext.mProjectionMat * gContext.mViewMat;
+     gContext.mMVP = gContext.mViewProjection * gContext.mModel;
+     gContext.mMVPLocal = gContext.mViewProjection * gContext.mModelLocal;
 
-     glm::mat4 viewInverse;
-     viewInverse = glm::inverse(gContext.mViewMat);
+     glm::mat4 viewInverse = glm::inverse(gContext.mViewMat);
      gContext.mCameraDir = viewInverse[2];
      gContext.mCameraEye = viewInverse[3];
      gContext.mCameraRight = viewInverse[0];
@@ -783,19 +993,21 @@ namespace GUIZMO_NAMESPACE
      gContext.mReversed = (nearPos.z / nearPos.w) > (farPos.z / farPos.w);
 
      // compute scale from the size of camera right vector projected on screen at the matrix position
-     glm::vec4 pointRight = glm::vec4(glm::vec3(viewInverse[0]), 1.0f);
-     pointRight = gContext.mViewProjection * pointRight;
-
      glm::vec4 rightViewInverse = glm::vec4(glm::vec3(viewInverse[0]), 0.0f);
      rightViewInverse = gContext.mModelInverse * rightViewInverse;
 
      float rightLength = GetSegmentLengthClipSpace(makeVect(0.f, 0.f), rightViewInverse);
-     gContext.mScreenFactor = gContext.mGizmoSizeClipSpace / rightLength;
+     gContext.mScreenFactor = (rightLength > FLT_EPSILON) ? (gContext.mGizmoSizeClipSpace / rightLength) : gContext.mGizmoSizeClipSpace;
 
      glm::vec2 centerSSpace = worldToPos(makeVect(0.f, 0.f), gContext.mMVP);
      gContext.mScreenSquareCenter = centerSSpace;
      gContext.mScreenSquareMin = glm::vec2(centerSSpace.x - 10.f, centerSSpace.y - 10.f);
      gContext.mScreenSquareMax = glm::vec2(centerSSpace.x + 10.f, centerSSpace.y + 10.f);
+
+     // this port has no imgui window system: the caller decides where the
+     // mouse is, so always treat the gizmo as hoverable (the old code reset
+     // this to false every frame which made the gizmo permanently inert)
+     gContext.mbMouseOver = true;
 
      ComputeCameraRay(gContext.mRayOrigin, gContext.mRayVector);
   }
@@ -855,11 +1067,12 @@ namespace GUIZMO_NAMESPACE
 
      if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID))
      {
-        // when using, use stored factors so the gizmo doesn't flip when we translate
-
-        // Apply axis mask to axes and planes
-        belowAxisLit = gContext.mBelowAxisLit[axisIndex] && ((1<<axisIndex)&gContext.mAxisMask);
-        belowPlaneLit = gContext.mBelowPlaneLit[axisIndex] && (((1<<axisIndex) == gContext.mAxisMask) || !gContext.mAxisMask);
+        // when using, use stored factors so the gizmo doesn't flip when we
+        // translate. The stored lit-flags already include the axis mask, so
+        // don't re-apply it here (the old code applied it twice, with the
+        // second application inverted).
+        belowAxisLit = gContext.mBelowAxisLit[axisIndex];
+        belowPlaneLit = gContext.mBelowPlaneLit[axisIndex];
 
         dirAxis *= gContext.mAxisFactor[axisIndex];
         dirPlaneX *= gContext.mAxisFactor[(axisIndex + 1) % 3];
@@ -879,9 +1092,9 @@ namespace GUIZMO_NAMESPACE
 
         // For readability
         bool & allowFlip = gContext.mAllowAxisFlip;
-        float mulAxis = (allowFlip && lenDir < lenDirMinus&& fabsf(lenDir - lenDirMinus) > FLT_EPSILON) ? -1.f : 1.f;
-        float mulAxisX = (allowFlip && lenDirPlaneX < lenDirMinusPlaneX&& fabsf(lenDirPlaneX - lenDirMinusPlaneX) > FLT_EPSILON) ? -1.f : 1.f;
-        float mulAxisY = (allowFlip && lenDirPlaneY < lenDirMinusPlaneY&& fabsf(lenDirPlaneY - lenDirMinusPlaneY) > FLT_EPSILON) ? -1.f : 1.f;
+        float mulAxis = (allowFlip && lenDir < lenDirMinus && fabsf(lenDir - lenDirMinus) > FLT_EPSILON) ? -1.f : 1.f;
+        float mulAxisX = (allowFlip && lenDirPlaneX < lenDirMinusPlaneX && fabsf(lenDirPlaneX - lenDirMinusPlaneX) > FLT_EPSILON) ? -1.f : 1.f;
+        float mulAxisY = (allowFlip && lenDirPlaneY < lenDirMinusPlaneY && fabsf(lenDirPlaneY - lenDirMinusPlaneY) > FLT_EPSILON) ? -1.f : 1.f;
         dirAxis *= mulAxis;
         dirPlaneX *= mulAxisX;
         dirPlaneY *= mulAxisY;
@@ -890,9 +1103,11 @@ namespace GUIZMO_NAMESPACE
         float axisLengthInClipSpace = GetSegmentLengthClipSpace(makeVect(0.f, 0.f, 0.f), dirAxis * gContext.mScreenFactor, localCoordinates);
 
         float paraSurf = GetParallelogram(makeVect(0.f, 0.f, 0.f), dirPlaneX * gContext.mScreenFactor, dirPlaneY * gContext.mScreenFactor);
-        // Apply axis mask to axes and planes
-        belowPlaneLit = (paraSurf > gContext.mAxisLit) && (((1<<axisIndex) == gContext.mAxisMask) || !gContext.mAxisMask);
-        belowAxisLit = (axisLengthInClipSpace > gContext.mPlaneLit) && !((1<<axisIndex)&gContext.mAxisMask);
+
+        // axis mask: bit i set == axis i hidden; the plane spanned by the two
+        // other axes stays visible when its "own" axis is the only hidden one
+        belowPlaneLit = (paraSurf > gContext.mAxisLit) && (((1 << axisIndex) == gContext.mAxisMask) || !gContext.mAxisMask);
+        belowAxisLit = (axisLengthInClipSpace > gContext.mPlaneLit) && !((1 << axisIndex) & gContext.mAxisMask);
 
         // and store values
         gContext.mAxisFactor[axisIndex] = mulAxis;
@@ -921,6 +1136,7 @@ namespace GUIZMO_NAMESPACE
         *value = *value - modulo + snap * ((*value < 0.f) ? -1.f : 1.f);
      }
   }
+
   static void ComputeSnap(glm::vec4& value, const float* snap)
   {
      for (int i = 0; i < 3; i++)
@@ -928,7 +1144,7 @@ namespace GUIZMO_NAMESPACE
         ComputeSnap(&value[i], snap[i]);
      }
   }
-  
+
   static float ComputeAngleOnPlan()
   {
       const float len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan);
@@ -963,24 +1179,22 @@ namespace GUIZMO_NAMESPACE
      U32 colors[7];
      ComputeColors(colors, type, ROTATE);
 
-     glm::vec4 viewDirNormalized;
-     glm::mat4 viewInverse;
+     // FIX: use the actual direction from the camera to the model (the old
+     // code used the camera forward axis plus invented sign tweaks, which
+     // misaligned the rotation circles whenever the object was off-center)
+     glm::vec3 cameraToModelNormalized;
      if (gContext.mIsOrthographic)
      {
-         viewInverse = glm::inverse(gContext.mViewMat);
-         viewDirNormalized = -viewInverse[2];
+         glm::mat4 viewInverse = glm::inverse(gContext.mViewMat);
+         cameraToModelNormalized = glm::vec3(viewInverse[2]);
      }
      else
      {
-         viewInverse = glm::inverse(gContext.mViewMat);
-         glm::vec3 right = glm::vec3(viewInverse[0]);
-         glm::vec3 up = glm::vec3(viewInverse[1]);
-         glm::vec3 dir = glm::vec3(viewInverse[2]);
-         const float handSign = (glm::dot(glm::cross(right, up), dir) >= 0.f) ? 1.f : -1.f;
-         viewDirNormalized = glm::vec4(glm::normalize(glm::vec3(gContext.mCameraDir)) * handSign, 0.f);
+         glm::vec3 camToModel = glm::vec3(gContext.mModel[3]) - glm::vec3(gContext.mCameraEye);
+         cameraToModelNormalized = (glm::length(camToModel) > FLT_EPSILON) ? glm::normalize(camToModel) : glm::vec3(0.f, 0.f, 1.f);
      }
 
-     viewDirNormalized = gContext.mModelInverse * glm::vec4(glm::vec3(viewDirNormalized), 0.f);
+     glm::vec3 camToLocal = glm::vec3(gContext.mModelInverse * glm::vec4(cameraToModelNormalized, 0.0f));
 
      gContext.mRadiusSquareCenter = screenRotateSize * gContext.mHeight;
 
@@ -992,18 +1206,18 @@ namespace GUIZMO_NAMESPACE
            continue;
         }
 
-        bool isAxisMasked = ((1 << (2 - axis)) & gContext.mAxisMask) != 0;
-
-        if ((!isAxisMasked || isMultipleAxesMasked) && !isNoAxesMasked)
+        // axis mask: bit i == axis i hidden (same convention as everywhere else)
+        bool isAxisMasked = ((1 << axis) & gContext.mAxisMask) != 0;
+        if (isAxisMasked && !isMultipleAxesMasked && !isNoAxesMasked)
         {
            continue;
         }
+
         const bool usingAxis = (gContext.mbUsing && type == MT_ROTATE_Z - axis);
         const int circleMul = (hasRSC && !usingAxis) ? 1 : 2;
 
-        glm::vec2* circlePos = (glm::vec2*)alloca(sizeof(glm::vec2) * (circleMul * halfCircleSegmentCount + 1));
-        const bool rightHanded = gContext.mProjectionMat[2][3] < 0.f;
-        float angleStart = atan2f(viewDirNormalized[(4 - axis) % 3], viewDirNormalized[(3 - axis) % 3]) + (gContext.mIsOrthographic ? ZPI : -ZPI) * 0.5f + (rightHanded ? 0.f : ZPI);
+        glm::vec2 circlePos[2 * halfCircleSegmentCount + 1];
+        const float angleStart = atan2f(camToLocal[(4 - axis) % 3], camToLocal[(3 - axis) % 3]) + ZPI * 0.5f;
 
         for (int i = 0; i < circleMul * halfCircleSegmentCount + 1; i++)
         {
@@ -1012,20 +1226,24 @@ namespace GUIZMO_NAMESPACE
            glm::vec4 pos = makeVect(axisPos[axis], axisPos[(axis + 1) % 3], axisPos[(axis + 2) % 3]) * gContext.mScreenFactor * rotationDisplayFactor;
            circlePos[i] = worldToPos(pos, gContext.mMVP);
         }
+
         if (!gContext.mbUsing || usingAxis)
         {
-           drawList->AddPolyline(circlePos, circleMul* halfCircleSegmentCount + 1, colors[3 - axis], gContext.mStyle.RotationLineThickness, 0);
+           if (GuiPointsValid(circlePos, circleMul * halfCircleSegmentCount + 1))
+           {
+              GuiAddPolyline(drawList, circlePos, circleMul * halfCircleSegmentCount + 1, colors[3 - axis], gContext.mStyle.RotationLineThickness, DrawFlags_None);
+           }
         }
 
-        float radiusAxis = sqrtf((glm::length2(worldToPos(gContext.mModel[3], gContext.mViewProjection) - circlePos[0])));
+        float radiusAxis = sqrtf(glm::length2(worldToPos(gContext.mModel[3], gContext.mViewProjection) - circlePos[0]));
         if (radiusAxis > gContext.mRadiusSquareCenter)
         {
            gContext.mRadiusSquareCenter = radiusAxis;
         }
      }
-     if(hasRSC && (!gContext.mbUsing || type == MT_ROTATE_SCREEN) && (!isMultipleAxesMasked && isNoAxesMasked))
+     if(hasRSC && (!gContext.mbUsing || type == MT_ROTATE_SCREEN) && !isMultipleAxesMasked && isNoAxesMasked)
      {
-        drawList->AddCircle(worldToPos(gContext.mModel[3], gContext.mViewProjection), gContext.mRadiusSquareCenter, colors[0], 64, gContext.mStyle.RotationOuterLineThickness);
+        GuiAddCircle(drawList, worldToPos(gContext.mModel[3], gContext.mViewProjection), gContext.mRadiusSquareCenter, colors[0], 64, gContext.mStyle.RotationOuterLineThickness);
      }
 
      if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsRotateType(type))
@@ -1040,11 +1258,6 @@ namespace GUIZMO_NAMESPACE
             glm::mat4 rotateVectorMatrix = glm::rotate(glm::mat4(1.0f), ng, glm::vec3(gContext.mTranslationPlan));
 
             glm::vec4 pos = rotateVectorMatrix * glm::vec4(glm::vec3(gContext.mRotationVectorSource), 1.0f);
-            if (fabsf(pos.w) > FLT_EPSILON)
-            {
-                pos /= pos.w;
-            }
-
             pos = glm::vec4(glm::vec3(pos) * (gContext.mScreenFactor * rotationDisplayFactor), 1.0f);
 
             glm::vec4 worldPos = pos + glm::vec4(glm::vec3(gContext.mModel[3]), 0.0f);
@@ -1052,8 +1265,11 @@ namespace GUIZMO_NAMESPACE
             circlePos[i] = worldToPos(worldPos, gContext.mViewProjection, glm::vec2(gContext.mX, gContext.mY), glm::vec2(gContext.mWidth, gContext.mHeight));
         }
 
-        drawList->AddConvexPolyFilled(circlePos, halfCircleSegmentCount + 1, GetColorU32(ROTATION_USING_FILL));
-        drawList->AddPolyline(circlePos, halfCircleSegmentCount + 1, GetColorU32(ROTATION_USING_BORDER), gContext.mStyle.RotationLineThickness, DrawFlags_Closed);
+        if (GuiPointsValid(circlePos, halfCircleSegmentCount + 1))
+        {
+           GuiAddConvexPolyFilled(drawList, circlePos, halfCircleSegmentCount + 1, GetColorU32(ROTATION_USING_FILL));
+           GuiAddPolyline(drawList, circlePos, halfCircleSegmentCount + 1, GetColorU32(ROTATION_USING_BORDER), gContext.mStyle.RotationLineThickness, DrawFlags_None);
+        }
 
         glm::vec2 destinationPosOnScreen = circlePos[1];
         char tmps[512];
@@ -1125,14 +1341,14 @@ namespace GUIZMO_NAMESPACE
                   {
                       U32 scaleLineColor = GetColorU32(SCALE_LINE);
                       drawList->AddLine(baseSSpace, worldDirSSpaceNoScale, scaleLineColor, gContext.mStyle.ScaleLineThickness);
-                      drawList->AddCircleFilled(worldDirSSpaceNoScale, gContext.mStyle.ScaleLineCircleSize, scaleLineColor);
+                      GuiAddCircleFilled(drawList, worldDirSSpaceNoScale, gContext.mStyle.ScaleLineCircleSize, scaleLineColor, 32);
                   }
 
                   if (!hasTranslateOnAxis || gContext.mbUsing)
                   {
                       drawList->AddLine(baseSSpace, worldDirSSpace, colors[i + 1], gContext.mStyle.ScaleLineThickness);
                   }
-                  drawList->AddCircleFilled(worldDirSSpace, gContext.mStyle.ScaleLineCircleSize, colors[i + 1]);
+                  GuiAddCircleFilled(drawList, worldDirSSpace, gContext.mStyle.ScaleLineCircleSize, colors[i + 1], 32);
 
                   if (gContext.mAxisFactor[i] < 0.f)
                   {
@@ -1142,7 +1358,7 @@ namespace GUIZMO_NAMESPACE
           }
       }
 
-      drawList->AddCircleFilled(gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32);
+      GuiAddCircleFilled(drawList, gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32);
 
       if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsScaleType(type))
       {
@@ -1156,8 +1372,8 @@ namespace GUIZMO_NAMESPACE
           glm::vec2 dif = glm::vec2(dif3.x, dif3.y) * 5.f;
 
           U32 translationLineColor = GetColorU32(TRANSLATION_LINE);
-          drawList->AddCircle(sourcePosOnScreen, 6.f, translationLineColor);
-          drawList->AddCircle(destinationPosOnScreen, 6.f, translationLineColor);
+          GuiAddCircle(drawList, sourcePosOnScreen, 6.f, translationLineColor, 12, 1.f);
+          GuiAddCircle(drawList, destinationPosOnScreen, 6.f, translationLineColor, 12, 1.f);
           drawList->AddLine(glm::vec2(sourcePosOnScreen.x + dif.x, sourcePosOnScreen.y + dif.y), glm::vec2(destinationPosOnScreen.x - dif.x, destinationPosOnScreen.y - dif.y), translationLineColor, 2.f);
 
           char tmps[512];
@@ -1210,27 +1426,20 @@ namespace GUIZMO_NAMESPACE
               glm::vec2 baseSSpace = worldToPos(dirAxis * 0.1f * gContext.mScreenFactor, gContext.mMVPLocal);
               glm::vec2 worldDirSSpaceNoScale = worldToPos(dirAxis * markerScale * gContext.mScreenFactor, gContext.mMVP);
               glm::vec2 worldDirSSpace = worldToPos((dirAxis * markerScale * scaleDisplay[i]) * gContext.mScreenFactor, gContext.mMVPLocal);
+              (void)baseSSpace;
+              (void)worldDirSSpaceNoScale;
 
-#if 0
-              if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID))
-              {
-                 drawList->AddLine(baseSSpace, worldDirSSpaceNoScale, _COL32(0x40, 0x40, 0x40, 0xFF), 3.f);
-                 drawList->AddCircleFilled(worldDirSSpaceNoScale, 6.f, _COL32(0x40, 0x40, 0x40, 0xFF));
-              }
-              
               if (!hasTranslateOnAxis || gContext.mbUsing)
               {
-                 drawList->AddLine(baseSSpace, worldDirSSpace, colors[i + 1], 3.f);
+                 drawList->AddLine(baseSSpace, worldDirSSpace, colors[i + 1], gContext.mStyle.ScaleLineThickness);
               }
-              
-#endif
-              drawList->AddCircleFilled(worldDirSSpace, 12.f, colors[i + 1]);
+              GuiAddCircleFilled(drawList, worldDirSSpace, 12.f, colors[i + 1], 32);
            }
         }
      }
 
-     // draw screen cirle
-     drawList->AddCircle(gContext.mScreenSquareCenter, 20.f, colors[0], 32, gContext.mStyle.CenterCircleSize);
+     // draw screen circle
+     GuiAddCircle(drawList, gContext.mScreenSquareCenter, 20.f, colors[0], 32, gContext.mStyle.CenterCircleSize);
 
      if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsScaleType(type))
      {
@@ -1244,12 +1453,11 @@ namespace GUIZMO_NAMESPACE
         glm::vec2 dif = glm::vec2(dif3.x, dif3.y) * 5.f;
         U32 translationLineColor = GetColorU32(TRANSLATION_LINE);
 
-        drawList->AddCircle(sourcePosOnScreen, 6.f, translationLineColor);
-        drawList->AddCircle(destinationPosOnScreen, 6.f, translationLineColor);
+        GuiAddCircle(drawList, sourcePosOnScreen, 6.f, translationLineColor, 12, 1.f);
+        GuiAddCircle(drawList, destinationPosOnScreen, 6.f, translationLineColor, 12, 1.f);
         drawList->AddLine(glm::vec2(sourcePosOnScreen.x + dif.x, sourcePosOnScreen.y + dif.y), glm::vec2(destinationPosOnScreen.x - dif.x, destinationPosOnScreen.y - dif.y), translationLineColor, 2.f);
-        
+
         char tmps[512];
-        glm::vec4 deltaInfo = gContext.mModel[3] - gContext.mMatrixOrigin;
         int componentInfoIndex = (type - MT_SCALE_X) * 3;
         FormatString(tmps, sizeof(tmps), scaleInfoMask[type - MT_SCALE_X], scaleDisplay[translationInfoIndex[componentInfoIndex]]);
         drawList->AddText(glm::vec2(destinationPosOnScreen.x + 15, destinationPosOnScreen.y + 15), GetColorU32(TEXT_SHADOW), tmps);
@@ -1292,19 +1500,25 @@ namespace GUIZMO_NAMESPACE
               glm::vec2 baseSSpace = worldToPos(dirAxis * 0.1f * gContext.mScreenFactor, gContext.mMVP);
               glm::vec2 worldDirSSpace = worldToPos(dirAxis * gContext.mScreenFactor, gContext.mMVP);
 
-              drawList->AddPolyline(&baseSSpace, baseSSpace.length(), colors[i + 1], gContext.mStyle.TranslationLineThickness, 1.0f);
+              // FIX: the old code called AddPolyline(&baseSSpace, baseSSpace.length(), ...)
+              // which passed ONE point but claimed TWO (vec2::length() == 2),
+              // reading a garbage second point from the stack.
+              drawList->AddLine(baseSSpace, worldDirSSpace, colors[i + 1], gContext.mStyle.TranslationLineThickness);
 
               // Arrow head begin
               glm::vec2 dir(origin - worldDirSSpace);
 
               float d = sqrtf(glm::length2(dir));
-              dir /= d; // Normalize
-              dir *= gContext.mStyle.TranslationLineArrowSize;
+              if (d > FLT_EPSILON)
+              {
+                 dir /= d; // Normalize
+                 dir *= gContext.mStyle.TranslationLineArrowSize;
 
-              glm::vec2 ortogonalDir(dir.y, -dir.x); // Perpendicular vector
-              glm::vec2 a(worldDirSSpace + dir);
-              drawList->AddTriangleFilled(worldDirSSpace - dir, a + ortogonalDir, a - ortogonalDir, colors[i + 1]);
-              // Arrow head end
+                 glm::vec2 ortogonalDir(dir.y, -dir.x); // Perpendicular vector
+                 glm::vec2 a(worldDirSSpace + dir);
+                 GuiAddTriangleFilled(drawList, worldDirSSpace - dir, a + ortogonalDir, a - ortogonalDir, colors[i + 1]);
+                 // Arrow head end
+              }
 
               if (gContext.mAxisFactor[i] < 0.f)
               {
@@ -1323,13 +1537,16 @@ namespace GUIZMO_NAMESPACE
                  glm::vec4 cornerWorldPos = (dirPlaneX * quadUV[j * 2] + dirPlaneY * quadUV[j * 2 + 1]) * gContext.mScreenFactor;
                  screenQuadPts[j] = worldToPos(cornerWorldPos, gContext.mMVP);
               }
-              drawList->AddPolyline(screenQuadPts, 4, GetColorU32(DIRECTION_X + i), 1.0f, DrawFlags_Closed);
-              drawList->AddConvexPolyFilled(screenQuadPts, 4, colors[i + 4]);
+              if (GuiPointsValid(screenQuadPts, 4))
+              {
+                 GuiAddPolyline(drawList, screenQuadPts, 4, GetColorU32(DIRECTION_X + i), 1.0f, DrawFlags_Closed);
+                 GuiAddConvexPolyFilled(drawList, screenQuadPts, 4, colors[i + 4]);
+              }
            }
         }
      }
 
-     drawList->AddCircleFilled(gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32);
+     GuiAddCircleFilled(drawList, gContext.mScreenSquareCenter, gContext.mStyle.CenterCircleSize, colors[0], 32);
 
      if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsTranslateType(type))
      {
@@ -1337,11 +1554,14 @@ namespace GUIZMO_NAMESPACE
 
         glm::vec2 sourcePosOnScreen = worldToPos(gContext.mMatrixOrigin, gContext.mViewProjection);
         glm::vec2 destinationPosOnScreen = worldToPos(gContext.mModel[3], gContext.mViewProjection);
-        glm::vec4 dif = { destinationPosOnScreen.x - sourcePosOnScreen.x, destinationPosOnScreen.y - sourcePosOnScreen.y, 0.f, 0.f };
-        glm::normalize(dif);
-        dif *= 5.f;
-        drawList->AddCircle(sourcePosOnScreen, 6.f, translationLineColor);
-        drawList->AddCircle(destinationPosOnScreen, 6.f, translationLineColor);
+
+        // FIX: glm::normalize(dif) was called but its result was discarded
+        glm::vec2 dif = destinationPosOnScreen - sourcePosOnScreen;
+        float difLen = glm::length(dif);
+        dif = (difLen > FLT_EPSILON) ? (dif * (5.f / difLen)) : glm::vec2(5.f, 0.f);
+
+        GuiAddCircle(drawList, sourcePosOnScreen, 6.f, translationLineColor, 12, 1.f);
+        GuiAddCircle(drawList, destinationPosOnScreen, 6.f, translationLineColor, 12, 1.f);
         drawList->AddLine(glm::vec2(sourcePosOnScreen.x + dif.x, sourcePosOnScreen.y + dif.y), glm::vec2(destinationPosOnScreen.x - dif.x, destinationPosOnScreen.y - dif.y), translationLineColor, 2.f);
 
         char tmps[512];
@@ -1353,18 +1573,20 @@ namespace GUIZMO_NAMESPACE
      }
   }
 
+  // FIX: the old version required the handle to already be "hovered" from a
+  // previous frame, but the hover flag was cleared at the start of every
+  // Manipulate call - so the gizmo could never be grabbed. Upstream only
+  // requires a mouse click; the hover test is the `type != MT_NONE` check
+  // performed by the caller.
   static bool CanActivate()
   {
       if (!gContext.mbEnable) return false;
-      if (gContext.mbUsing) return true;
+      if (gContext.mbUsing || gContext.mbUsingBounds) return true;
 
       IInput* input = gContext.mInput;
-      if (input->getMouseButtonDown(MouseButton::Left))
-      {
-          return gContext.mHoveredHandleType != MT_NONE;
-      }
+      if (!input) return false;
 
-      return false;
+      return input->getMouseButton(MouseButton::Left);
   }
 
   static bool HandleAndDrawLocalBounds(const float* bounds, glm::mat4* matrix, const float* snapValues, OPERATION operation)
@@ -1467,6 +1689,9 @@ namespace GUIZMO_NAMESPACE
           }
 
           U32 anchorAlpha = gContext.mbEnable ? 0xFF000000 : 0x80000000;
+
+          // FIX: this was one of the few compositions the port had right;
+          // kept as viewProjection * modelSource (glm column order)
           glm::mat4 boundsMVP = gContext.mViewProjection * gContext.mModelSource;
 
           for (int i = 0; i < 4; i++)
@@ -1564,14 +1789,14 @@ namespace GUIZMO_NAMESPACE
 
               if (bigAnchorVisible)
               {
-                  drawList->AddCircleFilled(worldBoundOrig, AnchorBigRadius, 0xFF000000);
-                  drawList->AddCircleFilled(worldBoundOrig, AnchorBigRadius - 1.2f, bigAnchorColor);
+                  GuiAddCircleFilled(drawList, worldBoundOrig, AnchorBigRadius, 0xFF000000, 32);
+                  GuiAddCircleFilled(drawList, worldBoundOrig, AnchorBigRadius - 1.2f, bigAnchorColor, 32);
               }
 
               if (smallAnchorVisible)
               {
-                  drawList->AddCircleFilled(midBound, AnchorSmallRadius, 0xFF000000);
-                  drawList->AddCircleFilled(midBound, AnchorSmallRadius - 1.2f, smallAnchorColor);
+                  GuiAddCircleFilled(drawList, midBound, AnchorSmallRadius, 0xFF000000, 32);
+                  GuiAddCircleFilled(drawList, midBound, AnchorSmallRadius - 1.2f, smallAnchorColor, 32);
               }
               int oppositeIndex = (i + 2) % 4;
 
@@ -1650,7 +1875,7 @@ namespace GUIZMO_NAMESPACE
                         ratioAxis = length / boundSize;
                     }
                 }
-                scale[axisIndex1] *= ratioAxis;
+                scale[axisIndex1][axisIndex1] *= ratioAxis;
 
                 if (fabsf(ratioAxis - 1.0f) > FLT_EPSILON) {
                     manipulated = true;
@@ -1659,7 +1884,12 @@ namespace GUIZMO_NAMESPACE
 
             glm::mat4 preScale = glm::translate(glm::mat4(1.0f), -glm::vec3(gContext.mBoundsLocalPivot));
             glm::mat4 postScale = glm::translate(glm::mat4(1.0f), glm::vec3(gContext.mBoundsLocalPivot));
-            glm::mat4 res = preScale * scale * postScale * gContext.mBoundsMatrix;
+
+            // FIX: glm column-vector convention - the upstream chain
+            // preScale * scale * postScale * boundsMatrix (row vectors) is
+            // written in REVERSED order here. The old code kept the upstream
+            // order, which scaled around the wrong pivot.
+            glm::mat4 res = gContext.mBoundsMatrix * postScale * scale * preScale;
             *matrix = res;
 
             char tmps[512];
@@ -1673,10 +1903,10 @@ namespace GUIZMO_NAMESPACE
             drawList->AddText(glm::vec2(destinationPosOnScreen.x + 14, destinationPosOnScreen.y + 14), GetColorU32(TEXT), tmps);
         }
 
-        if (!gContext.mInput->getMouseButton(MouseButton::Left))
+        if (!input->getMouseButton(MouseButton::Left))
         {
             gContext.mbUsingBounds = false;
-            gContext.mEditingID = -1;
+            gContext.mEditingID = (WidgetID)-1;
         }
 
         if (gContext.mbUsingBounds)
@@ -1688,16 +1918,16 @@ namespace GUIZMO_NAMESPACE
      return manipulated;
   }
 
-
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   //
 
   static MOVETYPE GetScaleType(OPERATION op)
   {
-      if (gContext.mbUsing)
+      if (!Intersects(op, SCALE) || gContext.mbUsing || !gContext.mbMouseOver)
       {
           return MT_NONE;
       }
+
       IInput* input = gContext.mInput;
       if (!input) return MT_NONE;
 
@@ -1751,10 +1981,7 @@ namespace GUIZMO_NAMESPACE
           }
       }
 
-      glm::vec2 deltaScreen = glm::vec2(
-          static_cast<float>(mouseX - gContext.mScreenSquareCenter.x),
-          static_cast<float>(mouseY - gContext.mScreenSquareCenter.y)
-      );
+      glm::vec2 deltaScreen = mousePos - gContext.mScreenSquareCenter;
 
       float dist = glm::length(deltaScreen);
       if (Contains(op, SCALEU) && dist >= 17.0f && dist < 23.0f)
@@ -1775,11 +2002,19 @@ namespace GUIZMO_NAMESPACE
 
           if (belowAxisLit)
           {
+              bool isAxisMasked = ((1 << i) & gContext.mAxisMask) != 0;
+              if (isAxisMasked)
+              {
+                  continue;
+              }
+
               bool hasTranslateOnAxis = Contains(op, static_cast<OPERATION>(TRANSLATE_X << i));
               float markerScale = hasTranslateOnAxis ? 1.4f : 1.0f;
               glm::vec2 baseSSpace = worldToPos(dirAxis * 0.1f * gContext.mScreenFactor, gContext.mMVPLocal, vpPos, vpSize);
               glm::vec2 worldDirSSpaceNoScale = worldToPos(dirAxis * markerScale * gContext.mScreenFactor, gContext.mMVP, vpPos, vpSize);
               glm::vec2 worldDirSSpace = worldToPos((dirAxis * markerScale) * gContext.mScreenFactor, gContext.mMVPLocal, vpPos, vpSize);
+              (void)baseSSpace;
+              (void)worldDirSSpaceNoScale;
 
               float distance = glm::distance(worldDirSSpace, mousePos);
               if (distance < 12.f)
@@ -1793,6 +2028,11 @@ namespace GUIZMO_NAMESPACE
 
   static MOVETYPE GetRotateType(OPERATION op)
   {
+      if (!Intersects(op, ROTATE) || gContext.mbUsing || !gContext.mbMouseOver)
+      {
+          return MT_NONE;
+      }
+
       IInput* input = gContext.mInput;
       if (!input) return MT_NONE;
 
@@ -1804,10 +2044,7 @@ namespace GUIZMO_NAMESPACE
       glm::vec2 mousePos(static_cast<float>(mouseX), static_cast<float>(mouseY));
       MOVETYPE type = MT_NONE;
 
-      glm::vec2 deltaScreen = glm::vec2(
-          static_cast<float>(mouseX - gContext.mScreenSquareCenter.x),
-          static_cast<float>(mouseY - gContext.mScreenSquareCenter.y)
-      );
+      glm::vec2 deltaScreen = mousePos - gContext.mScreenSquareCenter;
       float dist = glm::length(deltaScreen);
       if (Intersects(op, ROTATE_SCREEN) && dist >= (gContext.mRadiusSquareCenter - 4.0f) && dist < (gContext.mRadiusSquareCenter + 4.0f))
       {
@@ -1861,14 +2098,13 @@ namespace GUIZMO_NAMESPACE
           glm::vec4 idealPosWorld = glm::vec4(glm::vec3(idealPosOnCircle) * (rotationDisplayFactor * gContext.mScreenFactor), 1.0f);
           const glm::vec2 idealPosOnCircleScreen = worldToPos(idealPosWorld, mvpMat, vpPos, vpSize);
 
-          gContext.mDrawList->AddCircle(idealPosOnCircleScreen, 5.f, 0xFFFFFFFF);
           const glm::vec2 distanceOnScreen = idealPosOnCircleScreen - mousePos;
 
           const float distance = glm::length(distanceOnScreen);
           if (distance < 8.f)
           {
-              if ((!isAxisMasked || isMultipleAxesMasked) && !isNoAxesMasked)
-                  break;
+              if (isAxisMasked && !isMultipleAxesMasked && !isNoAxesMasked)
+                  continue;
               type = static_cast<MOVETYPE>(MT_ROTATE_X + i);
           }
       }
@@ -1954,7 +2190,6 @@ namespace GUIZMO_NAMESPACE
 
   static bool HandleTranslation(float* matrix, float* deltaMatrix, OPERATION op, MOVETYPE& type, const float* snap)
   {
-	  std::cout << "HandleTranslation called with op=" << op << " type=" << type << "\n";
       if (!Intersects(op, TRANSLATE) || type != MT_NONE)
       {
           return false;
@@ -1983,7 +2218,9 @@ namespace GUIZMO_NAMESPACE
           if (gContext.mCurrentHandleType >= MT_MOVE_X && gContext.mCurrentHandleType <= MT_MOVE_Z)
           {
               const int axisIndex = gContext.mCurrentHandleType - MT_MOVE_X;
-              const glm::vec4 axisValue = glm::vec4(glm::normalize(glm::vec3(modelMat[axisIndex])), 0.0f);
+              glm::vec3 axisDir = glm::vec3(modelMat[axisIndex]);
+              const float axisLen = glm::length(axisDir);
+              const glm::vec4 axisValue = glm::vec4((axisLen > FLT_EPSILON) ? (axisDir / axisLen) : glm::vec3(1.f, 0.f, 0.f), 0.0f);
               const float lengthOnAxis = glm::dot(axisValue, delta);
               delta = axisValue * lengthOnAxis;
           }
@@ -2003,12 +2240,16 @@ namespace GUIZMO_NAMESPACE
 
                   glm::mat4 modelSourceNormalizedInverse = glm::inverse(modelSourceNormalized);
                   cumulativeDelta = modelSourceNormalizedInverse * glm::vec4(glm::vec3(cumulativeDelta), 0.0f);
-                  ComputeSnap(&cumulativeDelta.x, snap[0]); // Пример вызова, адаптируйте под вашу ComputeSnap
+
+                  // FIX: snap every component (old code snapped X with snap[0] only)
+                  ComputeSnap(cumulativeDelta, snap);
+
                   cumulativeDelta = modelSourceNormalized * glm::vec4(glm::vec3(cumulativeDelta), 0.0f);
               }
               else
               {
-                  ComputeSnap(&cumulativeDelta.x, snap[0]);
+                  // FIX: snap every component (old code snapped X with snap[0] only)
+                  ComputeSnap(cumulativeDelta, snap);
               }
               delta = gContext.mMatrixOrigin + cumulativeDelta - modelPos;
           }
@@ -2025,7 +2266,13 @@ namespace GUIZMO_NAMESPACE
               memcpy(deltaMatrix, glm::value_ptr(deltaMatrixTranslation), sizeof(float) * 16);
           }
 
-          const glm::mat4 res = gContext.mModelSource * deltaMatrixTranslation;
+          // FIX: glm column order - the upstream composition
+          // modelSource * deltaTranslation (row vectors) means "apply the
+          // object transform first, then translate in world space", which in
+          // glm is deltaTranslation * modelSource. The old code kept the
+          // upstream order so the object was translated in its own local
+          // (rotated) space instead of world space.
+          const glm::mat4 res = deltaMatrixTranslation * gContext.mModelSource;
           *(glm::mat4*)matrix = res;
 
           if (!input->getMouseButton(MouseButton::Left))
@@ -2040,11 +2287,6 @@ namespace GUIZMO_NAMESPACE
           glm::vec4 gizmoHitProportion;
           type = gContext.mbOverGizmoHotspot ? MT_NONE : GetMoveType(op, &gizmoHitProportion);
           gContext.mbOverGizmoHotspot |= type != MT_NONE;
-
-          std::cout
-              << "CanActivate=" << CanActivate()
-              << " type=" << type
-              << "\n";
 
           if (CanActivate() && type != MT_NONE)
           {
@@ -2120,13 +2362,15 @@ namespace GUIZMO_NAMESPACE
               gContext.mEditingID = gContext.GetCurrentID();
               gContext.mCurrentHandleType = type;
 
+              // upstream uses the two OTHER local axes as the pickup plane
+              // normal for a scale axis (X scale -> Y normal, etc.)
               glm::vec4 movePlanNormal[] = {
-                 glm::vec4(glm::vec3(modelLocalMat[0]), 0.0f), // Ось X
-                 glm::vec4(glm::vec3(modelLocalMat[1]), 0.0f), // Ось Y
-                 glm::vec4(glm::vec3(modelLocalMat[2]), 0.0f), // Ось Z
-                 glm::vec4(glm::vec3(modelLocalMat[0]), 0.0f), // Дополнительные плоскости, если они нужны для SCALE
                  glm::vec4(glm::vec3(modelLocalMat[1]), 0.0f),
-                 glm::vec4(glm::vec3(modelLocalMat[2]), 0.0f), // Опечатка с ] исправлена здесь
+                 glm::vec4(glm::vec3(modelLocalMat[2]), 0.0f),
+                 glm::vec4(glm::vec3(modelLocalMat[0]), 0.0f),
+                 glm::vec4(glm::vec3(modelLocalMat[2]), 0.0f),
+                 glm::vec4(glm::vec3(modelLocalMat[1]), 0.0f),
+                 glm::vec4(glm::vec3(modelLocalMat[0]), 0.0f),
                  -gContext.mCameraDir
               };
 
@@ -2138,15 +2382,14 @@ namespace GUIZMO_NAMESPACE
               gContext.mRelativeOrigin = (gContext.mTranslationPlanOrigin - modelLocalPos) * (1.f / gContext.mScreenFactor);
 
               gContext.mScaleValueOrigin = glm::vec4(
-                  glm::length(glm::vec3(modelSourceMat[0])), // Длина вектора X
-                  glm::length(glm::vec3(modelSourceMat[1])), // Длина вектора Y
-                  glm::length(glm::vec3(modelSourceMat[2])), // Длина вектора Z
+                  glm::length(glm::vec3(modelSourceMat[0])),
+                  glm::length(glm::vec3(modelSourceMat[1])),
+                  glm::length(glm::vec3(modelSourceMat[2])),
                   0.f
               );
               gContext.mSaveMousePosx = static_cast<float>(mouseX);
           }
       }
-
 
       if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsScaleType(gContext.mCurrentHandleType))
       {
@@ -2158,12 +2401,15 @@ namespace GUIZMO_NAMESPACE
           if (gContext.mCurrentHandleType >= MT_SCALE_X && gContext.mCurrentHandleType <= MT_SCALE_Z)
           {
               int axisIndex = gContext.mCurrentHandleType - MT_SCALE_X;
-              glm::vec4 axisValue = glm::vec4(glm::normalize(glm::vec3(modelLocalMat[axisIndex])), 0.0f);
+              glm::vec3 axisDir = glm::vec3(modelLocalMat[axisIndex]);
+              const float axisLen = glm::length(axisDir);
+              glm::vec4 axisValue = glm::vec4((axisLen > FLT_EPSILON) ? (axisDir / axisLen) : glm::vec3(1.f, 0.f, 0.f), 0.0f);
               float lengthOnAxis = glm::dot(axisValue, delta);
               delta = axisValue * lengthOnAxis;
 
               glm::vec4 baseVector = gContext.mTranslationPlanOrigin - modelLocalPos;
-              float ratio = glm::dot(axisValue, baseVector + delta) / glm::dot(axisValue, baseVector);
+              float baseDot = glm::dot(axisValue, baseVector);
+              float ratio = (fabsf(baseDot) > FLT_EPSILON) ? (glm::dot(axisValue, baseVector + delta) / baseDot) : 1.f;
 
               gContext.mScale[axisIndex] = glm::max(ratio, 0.001f);
           }
@@ -2173,11 +2419,12 @@ namespace GUIZMO_NAMESPACE
               gContext.mScale = glm::vec4(glm::max(1.f + scaleDelta, 0.001f));
           }
 
+          // FIX: snap all components against snap[0] (old code snapped X only)
           if (snap)
           {
-              ComputeSnap(&gContext.mScale.x, snap[0]);
+              float scaleSnap[3] = { snap[0], snap[0], snap[0] };
+              ComputeSnap(gContext.mScale, scaleSnap);
           }
-
 
           for (int i = 0; i < 3; i++)
               gContext.mScale[i] = glm::max(gContext.mScale[i], 0.001f);
@@ -2190,7 +2437,11 @@ namespace GUIZMO_NAMESPACE
 
           glm::mat4 deltaMatrixScale = glm::scale(glm::mat4(1.0f), glm::vec3(gContext.mScale * gContext.mScaleValueOrigin));
 
-          glm::mat4 res = deltaMatrixScale * modelLocalMat;
+          // FIX: glm column order - upstream composes deltaScale * modelLocal
+          // with row vectors ("scale first, then local transform"), which in
+          // glm is modelLocal * deltaScale. The old code had the reverse, so
+          // scaling produced skew/offset instead of local scale.
+          glm::mat4 res = modelLocalMat * deltaMatrixScale;
           *(glm::mat4*)matrix = res;
 
           if (deltaMatrix)
@@ -2229,8 +2480,6 @@ namespace GUIZMO_NAMESPACE
       IInput* input = gContext.mInput;
       if (!input) return false;
 
-      double mouseX, mouseY;
-      input->getMousePosition(mouseX, mouseY);
       bool applyRotationLocaly = gContext.mMode == LOCAL;
       bool modified = false;
 
@@ -2242,35 +2491,34 @@ namespace GUIZMO_NAMESPACE
 
       if (!gContext.mbUsing)
       {
-          int type = gContext.mbOverGizmoHotspot ? MT_NONE : GetRotateType(op);
-          gContext.mbOverGizmoHotspot |= type != MT_NONE;
+          MOVETYPE newType = gContext.mbOverGizmoHotspot ? MT_NONE : GetRotateType(op);
+          gContext.mbOverGizmoHotspot |= newType != MT_NONE;
 
-          if (type == MT_ROTATE_SCREEN)
+          if (newType == MT_ROTATE_SCREEN)
           {
               applyRotationLocaly = true;
           }
 
-          if (CanActivate() && type != MT_NONE)
+          if (CanActivate() && newType != MT_NONE)
           {
               gContext.mbUsing = true;
               gContext.mEditingID = gContext.GetCurrentID();
-              gContext.mCurrentHandleType = static_cast<MOVETYPE>(type);
+              gContext.mCurrentHandleType = newType;
 
               glm::vec4 rotatePlanNormal[] = {
                  glm::vec4(glm::vec3(modelMat[0]), 0.0f),
-                 glm::vec4(glm::vec3(modelMat[1]), 0.0f), // Ось Y
-                 glm::vec4(glm::vec3(modelMat[2]), 0.0f), // Ось Z
+                 glm::vec4(glm::vec3(modelMat[1]), 0.0f),
+                 glm::vec4(glm::vec3(modelMat[2]), 0.0f),
                  -gContext.mCameraDir
               };
 
-
               if (applyRotationLocaly)
               {
-                  gContext.mTranslationPlan = BuildPlan(modelPos, rotatePlanNormal[type - MT_ROTATE_X]);
+                  gContext.mTranslationPlan = BuildPlan(modelPos, rotatePlanNormal[newType - MT_ROTATE_X]);
               }
               else
               {
-                  gContext.mTranslationPlan = BuildPlan(modelSourcePos, directionUnary[type - MT_ROTATE_X]);
+                  gContext.mTranslationPlan = BuildPlan(modelSourcePos, directionUnary[newType - MT_ROTATE_X]);
               }
 
               const float len = IntersectRayPlane(gContext.mRayOrigin, gContext.mRayVector, gContext.mTranslationPlan);
@@ -2282,6 +2530,9 @@ namespace GUIZMO_NAMESPACE
               gContext.mRotationVectorSource = glm::vec4(localPos3, 0.0f);
               gContext.mRotationAngleOrigin = ComputeAngleOnPlan();
           }
+
+          // propagate hover result so Manipulate can highlight the handle
+          type = newType;
       }
 
       if (gContext.mbUsing && (gContext.GetCurrentID() == gContext.mEditingID) && IsRotateType(gContext.mCurrentHandleType))
@@ -2312,27 +2563,35 @@ namespace GUIZMO_NAMESPACE
 
           if (applyRotationLocaly)
           {
-              *(glm::mat4*)matrix = scaleOrigin * deltaRotation * gContext.mModelLocal;
+              // FIX: glm column order. Upstream: scaleOrigin * deltaRotation *
+              // mModel with row vectors = "apply scale, then delta rotation,
+              // then the orthonormal model" - in glm the order reverses.
+              // NOTE: gContext.mModel (not mModelLocal) must be used here so
+              // that screen-space rotation in WORLD mode does not double
+              // apply the object orientation.
+              *(glm::mat4*)matrix = gContext.mModel * deltaRotation * scaleOrigin;
           }
           else
           {
               glm::mat4 res = modelSourceMat;
               res[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
 
-              glm::mat4 finalMat = res * deltaRotation;
+              // FIX: glm column order - "apply res first, then deltaRotation"
+              glm::mat4 finalMat = deltaRotation * res;
               finalMat[3] = modelSourceMat[3];
               *(glm::mat4*)matrix = finalMat;
           }
 
           if (deltaMatrix)
           {
-              *(glm::mat4*)deltaMatrix = gContext.mModelInverse * deltaRotation * modelMat;
+              // FIX: glm column order (was mModelInverse * deltaRotation * mModel)
+              *(glm::mat4*)deltaMatrix = gContext.mModel * deltaRotation * gContext.mModelInverse;
           }
 
           if (!input->getMouseButton(MouseButton::Left))
           {
               gContext.mbUsing = false;
-              gContext.mEditingID = -1;
+              gContext.mEditingID = (WidgetID)-1;
           }
           type = gContext.mCurrentHandleType;
       }
@@ -2355,6 +2614,8 @@ namespace GUIZMO_NAMESPACE
       mat[1] = glm::vec4(u, 0.0f);
       mat[2] = glm::vec4(d, 0.0f);
 
+      // NOTE: glm[i][j] maps 1:1 onto the upstream row-major m16[i*4+j] element,
+      // so the upstream extraction indices are valid here as-is.
       rotation[0] = RAD2DEG * atan2f(mat[1][2], mat[2][2]);
       rotation[1] = RAD2DEG * atan2f(-mat[0][2], sqrtf(mat[1][2] * mat[1][2] + mat[2][2] * mat[2][2]));
       rotation[2] = RAD2DEG * atan2f(mat[0][1], mat[0][0]);
@@ -2372,7 +2633,11 @@ namespace GUIZMO_NAMESPACE
       glm::mat4 rotY = glm::rotate(glm::mat4(1.0f), rotation[1] * DEG2RAD, glm::vec3(0.0f, 1.0f, 0.0f));
       glm::mat4 rotZ = glm::rotate(glm::mat4(1.0f), rotation[2] * DEG2RAD, glm::vec3(0.0f, 0.0f, 1.0f));
 
-      mat = rotX * rotY * rotZ;
+      // FIX: glm column order. Upstream composes rotX * rotY * rotZ with row
+      // vectors ("rotate around X first, then Y, then Z"); in glm the same
+      // spatial chain is rotZ * rotY * rotX. The old code kept the upstream
+      // order so decomposition/recomposition disagreed with each other.
+      mat = rotZ * rotY * rotX;
 
       float validScale[3];
       for (int i = 0; i < 3; i++)
@@ -2409,9 +2674,9 @@ namespace GUIZMO_NAMESPACE
   {
      if (gContext.mIDStack.empty())
      {
-        gContext.mIDStack.push_back(-1);
+        gContext.mIDStack.push_back((WidgetID)-1);
      }
-     gContext.mIDStack.back() = id;
+     gContext.mIDStack.back() = (WidgetID)id;
   }
 
   WidgetID GetID(const char* str, const char* str_end)
@@ -2466,12 +2731,12 @@ namespace GUIZMO_NAMESPACE
 
   void PopID()
   {
-     _ASSERT(gContext.mIDStack.size() > 1);
-     gContext.mIDStack.pop_back();
-     if (gContext.mIDStack.empty())
+     assert(gContext.mIDStack.size() > 1);
+     if (gContext.mIDStack.size() <= 1)
      {
-        gContext.mIDStack.clear();
+        return;
      }
+     gContext.mIDStack.pop_back();
   }
 
   void AllowAxisFlip(bool value)
@@ -2481,7 +2746,7 @@ namespace GUIZMO_NAMESPACE
 
   void SetAxisLit(float value)
   {
-    gContext.mAxisLit=value;
+    gContext.mAxisLit = value;
   }
 
   void SetAxisMask(bool x, bool y, bool z)
@@ -2520,67 +2785,71 @@ namespace GUIZMO_NAMESPACE
 
   Ray ComputeCameraRay()
   {
-      glm::vec2 position =
-      { gContext.mX, gContext.mY };
-      glm::vec2 size =
-      { gContext.mWidth, gContext.mHeight };
+      glm::vec2 position = { gContext.mX, gContext.mY };
+      glm::vec2 size = { gContext.mWidth, gContext.mHeight };
       ComputeCameraRay(gContext.mRayOrigin, gContext.mRayVector, position, size);
-      Ray ray;
 
-      ray.origin = gContext.mRayOrigin;
-      ray.direction = gContext.mRayVector;
+      Ray ray;
+      ray.origin = glm::vec3(gContext.mRayOrigin);
+      ray.direction = glm::vec3(gContext.mRayVector);
 
       return ray;
   }
 
   bool Manipulate(const float* view, const float* projection, OPERATION operation, MODE mode, float* matrix, float* deltaMatrix, const float* snap, const float* localBounds, const float* boundsSnap)
   {
-      gContext.mDrawList->PushClipRect(glm::vec2(gContext.mX, gContext.mY), glm::vec2(gContext.mX + gContext.mWidth, gContext.mY + gContext.mHeight), false);
+      DrawList* drawList = gContext.mDrawList;
+      if (!drawList || !matrix || !view || !projection)
+      {
+          return false;
+      }
 
+      drawList->PushClipRect(glm::vec2(gContext.mX, gContext.mY), glm::vec2(gContext.mX + gContext.mWidth, gContext.mY + gContext.mHeight), false);
+
+      // scale gizmo is always local, otherwise the matrix would skew when
+      // applying world scale or oriented matrices
       ComputeContext(view, projection, matrix, (operation & SCALE) ? LOCAL : mode);
       gContext.mHoveredHandleType = MT_NONE;
+      gContext.mbOverGizmoHotspot = false;
 
       if (deltaMatrix)
       {
           *(glm::mat4*)deltaMatrix = glm::mat4(1.0f);
       }
 
-      glm::mat4 mvpMat = gContext.mMVP;
-      glm::vec4 camSpacePosition = mvpMat * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-      glm::vec4 viewPos = gContext.mViewMat * gContext.mModel[3];
-      std::cout
-          << "viewPos = "
-          << viewPos.x << " "
-          << viewPos.y << " "
-          << viewPos.z << " "
-          << viewPos.w << "\n";
-      //if (!gContext.mIsOrthographic &&
-      //    viewPos.z > -0.001f &&
-      //    !gContext.mbUsing)
-      //{
-      //    gContext.mDrawList->PopClipRect();
-      //    return false;
-      //}
+      // behind camera
+      glm::vec4 camSpacePosition = gContext.mMVP * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+      if (!gContext.mIsOrthographic && camSpacePosition.z < 0.001f)
+      {
+          gContext.mbMouseOver = false;
+          drawList->PopClipRect();
+          return false;
+      }
+      gContext.mbMouseOver = true;
 
+      // FIX: the whole interaction pipeline was commented out in the old
+      // port, `type` stayed MT_NONE forever and Manipulate returned 1 - the
+      // gizmo rendered but could never be dragged and always reported success.
       MOVETYPE type = MT_NONE;
-      //bool manipulated = false;
-      //if (gContext.mbEnable)
-      //{
-      //    if (!gContext.mbUsingBounds)
-      //    {
-      //        manipulated = HandleTranslation(matrix, deltaMatrix, operation, type, snap) ||
-      //            HandleScale(matrix, deltaMatrix, operation, type, snap) ||
-      //            HandleRotation(matrix, deltaMatrix, operation, type, snap);
-      //    }
-      //}
+      bool manipulated = false;
+      if (gContext.mbEnable)
+      {
+          if (!gContext.mbUsingBounds)
+          {
+              manipulated = HandleTranslation(matrix, deltaMatrix, operation, type, snap) ||
+                            HandleScale(matrix, deltaMatrix, operation, type, snap) ||
+                            HandleRotation(matrix, deltaMatrix, operation, type, snap);
+          }
+      }
 
-      //if (localBounds && !gContext.mbUsing)
-      //{
-      //    manipulated |= HandleAndDrawLocalBounds(localBounds, (glm::mat4*)matrix, boundsSnap, operation);
-      //}
+      if (localBounds && !gContext.mbUsing)
+      {
+          manipulated |= HandleAndDrawLocalBounds(localBounds, (glm::mat4*)matrix, boundsSnap, operation);
+      }
 
       gContext.mOperation = operation;
       gContext.mHoveredHandleType = (!gContext.mbUsing && !gContext.mbUsingBounds) ? type : MT_NONE;
+
       if (!gContext.mbUsingBounds)
       {
           DrawRotationGizmo(operation, type);
@@ -2589,8 +2858,8 @@ namespace GUIZMO_NAMESPACE
           DrawScaleUniveralGizmo(operation, type);
       }
 
-      gContext.mDrawList->PopClipRect();
-      return 1;
+      drawList->PopClipRect();
+      return manipulated;
   }
 
   void SetGizmoSizeClipSpace(float value)
@@ -2599,7 +2868,10 @@ namespace GUIZMO_NAMESPACE
   }
 
   ///////////////////////////////////////////////////////////////////////////////////////////////////
-  void ComputeFrustumPlanes(glm::vec4* frustum, const float* clip)
+  // Griwodanic frustum plane extraction. The memory pattern
+  // (clip[3]-clip[0], clip[7]-clip[4], ...) is layout-correct for BOTH the
+  // upstream row-major and this glm column-major storage.
+  static void ComputeFrustumPlanes(glm::vec4* frustum, const float* clip)
   {
      frustum[0].x = clip[3] - clip[0];
      frustum[0].y = clip[7] - clip[4];
@@ -2631,14 +2903,30 @@ namespace GUIZMO_NAMESPACE
      frustum[5].z = clip[11] + clip[10];
      frustum[5].w = clip[15] + clip[14];
 
+     // FIX: glm::normalize(frustum[i]) was called with the result discarded,
+     // so the planes were never actually normalized
      for (int i = 0; i < 6; i++)
      {
-         glm::normalize(frustum[i]);
+         float len = sqrtf(frustum[i].x * frustum[i].x + frustum[i].y * frustum[i].y + frustum[i].z * frustum[i].z);
+         if (len > FLT_EPSILON)
+         {
+             float inv = 1.f / len;
+             frustum[i].x *= inv;
+             frustum[i].y *= inv;
+             frustum[i].z *= inv;
+             frustum[i].w *= inv;
+         }
      }
   }
-  
+
   void DrawAxes(const float* view, const float* projection, const float* matrices, int matrixCount)
   {
+      DrawList* drawList = gContext.mDrawList;
+      if (!drawList)
+      {
+          return;
+      }
+
       glm::mat4 viewM = *(const glm::mat4*)view;
       glm::mat4 projM = *(const glm::mat4*)projection;
       glm::mat4 viewProj = projM * viewM;
@@ -2692,26 +2980,31 @@ namespace GUIZMO_NAMESPACE
                   continue;
               }
 
-              glm::vec2 p0 = worldToPos(glm::vec4(0.f, 0.f, 0.f, 1.f), mvp, vpPos, vpSize);
-              glm::vec2 p1 = worldToPos(glm::vec4(glm::vec3(endLocal), 1.f), mvp, vpPos, vpSize);
+              // FIX: the old code projected (0,0,0) instead of the model-space
+              // origin, so the line base was wrong for translated objects
+              glm::vec2 p0 = worldToPos(origin, mvp, vpPos, vpSize);
+              glm::vec2 p1 = worldToPos(end, mvp, vpPos, vpSize);
 
-              glm::vec4 clip0 = mvp * glm::vec4(0.f, 0.f, 0.f, 1.f);
-              glm::vec4 clip1 = mvp * glm::vec4(glm::vec3(endLocal), 1.f);
+              glm::vec4 clip0 = mvp * origin;
+              glm::vec4 clip1 = mvp * end;
 
               if (clip0.w <= 0.f && clip1.w <= 0.f)
               {
                   continue;
               }
 
-              gContext.mDrawList->AddLine(p0, p1, axes[a].color, 2.0f);
+              drawList->AddLine(p0, p1, axes[a].color, 2.0f);
           }
       }
   }
 
   void DrawCubes(const float* view, const float* projection, const float* matrices, int matrixCount)
   {
-     glm::mat4 viewInverse;
-     viewInverse = glm::inverse(*(glm::mat4*)view);
+     DrawList* drawList = gContext.mDrawList;
+     if (!drawList)
+     {
+        return;
+     }
 
      struct CubeFace
      {
@@ -2719,15 +3012,14 @@ namespace GUIZMO_NAMESPACE
         glm::vec2 faceCoordsScreen[4];
         U32 color;
      };
-     CubeFace* faces = (CubeFace*)_malloca(sizeof(CubeFace) * matrixCount * 6);
-
-     if (!faces)
-     {
-        return;
-     }
+     // FIX: the old code used _malloca without including <malloc.h> (and it is
+     // not portable anyway)
+     std::vector<CubeFace> faces((size_t)matrixCount * 6);
 
      glm::vec4 frustum[6];
-     glm::mat4 viewProjection = *(glm::mat4*)view * *(glm::mat4*)projection;
+
+     // FIX: glm column order (was view * projection)
+     glm::mat4 viewProjection = *(glm::mat4*)projection * *(glm::mat4*)view;
      ComputeFrustumPlanes(frustum, glm::value_ptr(viewProjection));
 
      int cubeFaceCount = 0;
@@ -2735,7 +3027,9 @@ namespace GUIZMO_NAMESPACE
      {
         const float* matrix = &matrices[cube * 16];
 
-        glm::mat4 res = *(glm::mat4*)matrix * *(glm::mat4*)view * *(glm::mat4*)projection;
+        // FIX: glm column order (was matrix * view * projection)
+        glm::mat4 res = viewProjection * *(glm::mat4*)matrix;
+        glm::mat4 modelMat = *(glm::mat4*)matrix;
 
         for (int iFace = 0; iFace < 6; iFace++)
         {
@@ -2750,49 +3044,19 @@ namespace GUIZMO_NAMESPACE
               directionUnary[normalIndex] - directionUnary[perpXIndex] + directionUnary[perpYIndex],
            };
 
-           // clipping
-           /*
-           bool skipFace = false;
-           for (unsigned int iCoord = 0; iCoord < 4; iCoord++)
-           {
-              glm::vec4 camSpacePosition;
-              camSpacePosition.TransformPoint(faceCoords[iCoord] * 0.5f * invert, res);
-              if (camSpacePosition.z < 0.001f)
-              {
-                 skipFace = true;
-                 break;
-              }
-           }
-           if (skipFace)
-           {
-              continue;
-           }
-           */
-           glm::vec4 centerPosition, centerPositionVP;
-           centerPosition = *(const glm::mat4*)matrix * glm::vec4(glm::vec3(directionUnary[normalIndex]) * 0.5f * invert, 1.0f);
-           centerPositionVP = res * glm::vec4(glm::vec3(directionUnary[normalIndex]) * 0.5f * invert, 1.0f);
+           glm::vec4 centerPosition = modelMat * glm::vec4(glm::vec3(directionUnary[normalIndex]) * 0.5f * invert, 1.0f);
+           glm::vec4 centerPositionVP = res * glm::vec4(glm::vec3(directionUnary[normalIndex]) * 0.5f * invert, 1.0f);
 
+           // FIX: the old frustum-cull code had a dead `inFrustum` flag that
+           // could never become false, so nothing was ever culled
            bool inFrustum = true;
            for (int iFrustum = 0; iFrustum < 6; iFrustum++)
            {
-               const glm::vec4& plane = frustum[iFrustum];
-
-               bool allOutside = true;
-
-               for (unsigned int iCoord = 0; iCoord < 4; iCoord++)
-               {
-                   glm::vec4 worldPos = *(const glm::mat4*)matrix * glm::vec4(glm::vec3(faceCoords[iCoord]) * 0.5f * invert, 1.0f);
-
-                   if (DistanceToPlane(worldPos, plane) >= 0.f)
-                   {
-                       allOutside = false;
-                       break;
-                   }
-               }
-
-              if (allOutside)
+              float dist = DistanceToPlane(centerPosition, frustum[iFrustum]);
+              if (dist < 0.f)
               {
-                 continue; // face is fully outside this plane - discard
+                 inFrustum = false;
+                 break;
               }
            }
 
@@ -2800,13 +3064,24 @@ namespace GUIZMO_NAMESPACE
            {
               continue;
            }
+
            CubeFace& cubeFace = faces[cubeFaceCount];
 
            // 3D->2D
-           //glm::vec2 faceCoordsScreen[4];
+           bool valid = true;
            for (unsigned int iCoord = 0; iCoord < 4; iCoord++)
            {
               cubeFace.faceCoordsScreen[iCoord] = worldToPos(faceCoords[iCoord] * 0.5f * invert, res);
+              if (cubeFace.faceCoordsScreen[iCoord].x <= -1e30f)
+              {
+                 valid = false;
+                 break;
+              }
+           }
+
+           if (!valid)
+           {
+              continue;
            }
 
            U32 directionColor = GetColorU32(DIRECTION_X + normalIndex);
@@ -2816,7 +3091,7 @@ namespace GUIZMO_NAMESPACE
            cubeFaceCount++;
         }
      }
-     qsort(faces, cubeFaceCount, sizeof(CubeFace), [](void const* _a, void const* _b) {
+     qsort(faces.data(), cubeFaceCount, sizeof(CubeFace), [](void const* _a, void const* _b) {
         CubeFace* a = (CubeFace*)_a;
         CubeFace* b = (CubeFace*)_b;
         if (a->z < b->z)
@@ -2829,26 +3104,23 @@ namespace GUIZMO_NAMESPACE
      for (int iFace = 0; iFace < cubeFaceCount; iFace++)
      {
         const CubeFace& cubeFace = faces[iFace];
-        gContext.mDrawList->AddConvexPolyFilled(cubeFace.faceCoordsScreen, 4, cubeFace.color);
+        GuiAddConvexPolyFilled(drawList, cubeFace.faceCoordsScreen, 4, cubeFace.color);
      }
-
-     _freea(faces);
   }
 
   void DrawGrid(const float* view, const float* projection, const float* matrix, const float gridSize)
   {
+     DrawList* drawList = gContext.mDrawList;
+     if (!drawList)
+     {
+        return;
+     }
+
      glm::mat4 viewProjection = *(glm::mat4*)projection * *(glm::mat4*)view;
      glm::vec4 frustum[6];
      ComputeFrustumPlanes(frustum, glm::value_ptr(viewProjection));
      glm::mat4 res = viewProjection * *(glm::mat4*)matrix;
-     glm::vec4 origin = res * glm::vec4(0, 0, 0, 1);
 
-     //std::cout
-     //    << origin.x << " "
-     //    << origin.y << " "
-     //    << origin.z << " "
-     //    << origin.w
-     //    << std::endl;
      for (float f = -gridSize; f <= gridSize; f += 1.f)
      {
         for (int dir = 0; dir < 2; dir++)
@@ -2892,7 +3164,7 @@ namespace GUIZMO_NAMESPACE
               thickness = (fmodf(fabsf(f), 10.f) < FLT_EPSILON) ? 1.5f : thickness;
               thickness = (fabsf(f) < FLT_EPSILON) ? 2.3f : thickness;
 
-              gContext.mDrawList->AddLine(worldToPos(ptA, res), worldToPos(ptB, res), col, thickness);
+              drawList->AddLine(worldToPos(ptA, res), worldToPos(ptB, res), col, thickness);
            }
         }
      }
@@ -2908,15 +3180,22 @@ namespace GUIZMO_NAMESPACE
 
   void DrawGridCustomColor(const float* view, const float* projection, const float* matrix, const float gridSize, const float majorStep, const unsigned int subdivision, const U32 majorCol, const U32 minorCol, const U32 centerCol)
   {
-      // Must have at least 1 subdivision
-      _ASSERT(subdivision > 0 && "At least 1 segment required!");
+      DrawList* drawList = gContext.mDrawList;
+      if (!drawList)
+      {
+          return;
+      }
 
-      glm::mat4 viewProjection = *(glm::mat4*)view * *(glm::mat4*)projection;
+      // Must have at least 1 subdivision
+      assert(subdivision > 0 && "At least 1 segment required!");
+
+      // FIX: glm column order (was view * projection and matrix * viewProjection)
+      glm::mat4 viewProjection = *(glm::mat4*)projection * *(glm::mat4*)view;
 
       glm::vec4 frustum[6];
       ComputeFrustumPlanes(frustum, glm::value_ptr(viewProjection));
 
-      glm::mat4 res = *(glm::mat4*)matrix * viewProjection;
+      glm::mat4 res = viewProjection * *(glm::mat4*)matrix;
 
       const float minorStep = majorStep / (float)subdivision;
       const int lineCount = (int)ceilf(gridSize / minorStep);
@@ -2979,7 +3258,7 @@ namespace GUIZMO_NAMESPACE
 
               if (visible)
               {
-                  gContext.mDrawList->AddLine(
+                  drawList->AddLine(
                       worldToPos(ptA, res),
                       worldToPos(ptB, res),
                       col,
@@ -3000,23 +3279,26 @@ namespace GUIZMO_NAMESPACE
   {
       static bool isDraging = false;
       static bool isClicking = false;
-      static glm::vec4 interpolationUp(0.f);
-      static glm::vec4 interpolationDir(0.f);
+      static bool isInside = false;
+      static glm::vec4 interpolationUp(0.f, 0.f, 0.f, 0.f);
+      static glm::vec4 interpolationDir(0.f, 0.f, 0.f, 0.f);
       static int interpolationFrames = 0;
       const glm::vec4 referenceUp = glm::vec4(0.f, 1.f, 0.f, 0.f);
+
+      DrawList* drawList = gContext.mDrawList;
+      IInput* input = gContext.mInput;
+      if (!drawList || !input || !view)
+      {
+          return;
+      }
 
       glm::mat4 svgView = gContext.mViewMat;
       glm::mat4 svgProjection = gContext.mProjectionMat;
 
-      IInput* input = gContext.mInput;
-      if (!input) return;
+      glm::vec2 mousePos = input->getMousePosition();
+      glm::vec2 mouseDelta = input->getMouseDelta();
 
-      double mouseX, mouseY;
-      input->getMousePosition(mouseX, mouseY);
-      double mouseDx, mouseDy;
-      input->getMouseDelta(mouseDx, mouseDy);
-
-      gContext.mDrawList->AddRectFilled(position, position + size, backgroundColor);
+      drawList->AddRectFilled(position, position + size, backgroundColor);
 
       glm::mat4 viewMatrix = glm::make_mat4(view);
       glm::mat4 viewInverse = glm::inverse(viewMatrix);
@@ -3024,22 +3306,23 @@ namespace GUIZMO_NAMESPACE
       const bool rightHanded = gContext.mProjectionMat[2][3] < 0.f;
       const float handednessSign = rightHanded ? 1.f : -1.f;
 
-      glm::vec4 camDir = viewInverse[2];
-      glm::vec4 camTarget = viewInverse[3] - camDir * handednessSign * length;
+      glm::vec4 camTarget = viewInverse[3] - viewInverse[2] * handednessSign * length;
 
+      // view/projection matrices
       const float distance = 3.f;
       glm::mat4 cubeProjection, cubeView;
       float fov = acosf(distance / (sqrtf(distance * distance + 3.f))) * RAD2DEG;
 
       Perspective(fov / sqrtf(2.f), size.x / size.y, 0.01f, 1000.f, glm::value_ptr(cubeProjection), rightHanded);
 
-      glm::vec4 dir = glm::vec4(viewInverse[2][0], viewInverse[2][1], viewInverse[2][2], 0.f);
-      glm::vec4 up = glm::vec4(viewInverse[1][0], viewInverse[1][1], viewInverse[1][2], 0.f);
+      glm::vec4 dir = glm::vec4(glm::vec3(viewInverse[2]), 0.f);
+      glm::vec4 up = glm::vec4(glm::vec3(viewInverse[1]), 0.f);
       glm::vec4 eye = dir * handednessSign * distance;
       glm::vec4 zero = glm::vec4(0.f, 0.f, 0.f, 1.f);
 
       LookAt(&eye.x, &zero.x, &up.x, glm::value_ptr(cubeView), rightHanded);
 
+      // set context
       gContext.mViewMat = cubeView;
       gContext.mProjectionMat = cubeProjection;
       ComputeCameraRay(gContext.mRayOrigin, gContext.mRayVector, position, size);
@@ -3058,8 +3341,8 @@ namespace GUIZMO_NAMESPACE
           glm::vec2(0.25f, 0.25f), glm::vec2(0.5f, 0.25f), glm::vec2(0.25f, 0.25f)
       };
 
+      // tag faces
       bool boxes[27]{};
-      static int overBox = -1;
 
       for (int iPass = 0; iPass < 2; iPass++)
       {
@@ -3076,6 +3359,7 @@ namespace GUIZMO_NAMESPACE
 
               const glm::vec4 n = directionUnary[normalIndex] * invert;
 
+              // back face culling
               glm::vec4 viewSpaceNormal = cubeView * n;
               viewSpaceNormal.w = 0.f;
               viewSpaceNormal = glm::normalize(viewSpaceNormal);
@@ -3108,36 +3392,122 @@ namespace GUIZMO_NAMESPACE
                       dx * (p.x + s.x) + dy * p.y
                   };
 
+                  bool valid = true;
                   for (unsigned int iCoord = 0; iCoord < 4; iCoord++)
                   {
                       faceCoordsScreen[iCoord] = worldToPos((panelPos[iCoord] + origin) * 0.5f * invert, res, position, size);
+                      if (faceCoordsScreen[iCoord].x <= -1e30f)
+                      {
+                          valid = false;
+                          break;
+                      }
+                  }
+
+                  if (!valid)
+                  {
+                      continue;
                   }
 
                   const glm::vec2 panelCorners[2] = { panelPosition[iPanel], panelPosition[iPanel] + panelSize[iPanel] };
                   bool insidePanel = localx > panelCorners[0].x && localx < panelCorners[1].x && localy > panelCorners[0].y && localy < panelCorners[1].y;
                   int boxCoordInt = int(boxCoord.x * 9.f + boxCoord.y * 3.f + boxCoord.z);
+                  if (boxCoordInt < 0 || boxCoordInt >= 27)
+                  {
+                      continue;
+                  }
 
                   boxes[boxCoordInt] |= insidePanel && (!isDraging) && gContext.mbMouseOver;
 
                   if (iPass)
                   {
                       U32 directionColor = GetColorU32(DIRECTION_X + normalIndex);
-                      gContext.mDrawList->AddConvexPolyFilled(faceCoordsScreen, 4, (directionColor | _COL32(128, 128, 128, 128)));
+                      GuiAddConvexPolyFilled(drawList, faceCoordsScreen, 4, (directionColor | _COL32(128, 128, 128, 128)));
 
                       if (boxes[boxCoordInt])
                       {
                           U32 selectionColor = GetColorU32(SELECTION);
-                          gContext.mDrawList->AddConvexPolyFilled(faceCoordsScreen, 4, selectionColor);
+                          GuiAddConvexPolyFilled(drawList, faceCoordsScreen, 4, selectionColor);
 
-                          if (input->getMouseButtonDown(MouseButton::Left) && !isClicking && !isDraging) {
-                              overBox = boxCoordInt;
+                          const bool mouseHeld = input->getMouseButton(MouseButton::Left);
+
+                          if (mouseHeld && !isDraging)
+                          {
                               isClicking = true;
-                              isDraging = true;
+                          }
+
+                          // apply new view direction on click (release over the same panel)
+                          if (!mouseHeld && !isDraging && isClicking)
+                          {
+                              int cx = boxCoordInt / 9;
+                              int cy = (boxCoordInt - cx * 9) / 3;
+                              int cz = boxCoordInt % 3;
+                              interpolationDir = glm::vec4(1.f - (float)cx, 1.f - (float)cy, 1.f - (float)cz, 0.f) * handednessSign;
+                              interpolationDir = glm::normalize(interpolationDir);
+
+                              if (fabsf(glm::dot(interpolationDir, referenceUp)) > 1.0f - 0.01f)
+                              {
+                                  // looking straight up/down: derive a valid up
+                                  // from the camera right vector (the old code
+                                  // assigned referenceUp here which made LookAt
+                                  // degenerate/NaN for parallel up & dir)
+                                  glm::vec3 right = glm::vec3(viewInverse[0]);
+                                  if (fabsf(right.x) > fabsf(right.z)) right.z = 0.f; else right.x = 0.f;
+                                  right = glm::normalize(right);
+                                  interpolationUp = glm::vec4(glm::normalize(glm::cross(glm::vec3(interpolationDir), right)), 0.f);
+                              }
+                              else
+                              {
+                                  interpolationUp = referenceUp;
+                              }
+                              interpolationFrames = 40;
+                              isClicking = false;
                           }
                       }
                   }
               }
           }
+      }
+
+      isInside = Rect(position, position + size).Contains(mousePos);
+      gContext.mIsViewManipulatorHovered = isInside && gContext.mbMouseOver;
+
+      // FIX: drag-to-rotate was entirely missing from the old port. Restored
+      // with the upstream math converted to glm column order.
+      if (!isDraging && input->getMouseButton(MouseButton::Left) && isInside && (fabsf(mouseDelta.x) > 0.f || fabsf(mouseDelta.y) > 0.f))
+      {
+          isDraging = true;
+          isClicking = false;
+      }
+      else if (isDraging && !input->getMouseButton(MouseButton::Left))
+      {
+          isDraging = false;
+      }
+
+      if (isDraging)
+      {
+          // spatial chain: rotate around world up by -dx, then around the
+          // camera right axis by -dy (upstream rx * ry in row-vector order)
+          glm::mat4 rx = glm::rotate(glm::mat4(1.0f), -mouseDelta.x * 0.01f, glm::vec3(referenceUp));
+          glm::mat4 ry = glm::rotate(glm::mat4(1.0f), -mouseDelta.y * 0.01f, glm::vec3(viewInverse[0]));
+          glm::mat4 roll = ry * rx;
+
+          glm::vec4 newDir = roll * viewInverse[2];
+          newDir = glm::normalize(newDir);
+
+          // clamp
+          glm::vec3 planDir = glm::cross(glm::vec3(viewInverse[0]), glm::vec3(referenceUp));
+          planDir.y = 0.f;
+          planDir = (glm::length(planDir) > FLT_EPSILON) ? glm::normalize(planDir) : glm::vec3(0.f);
+
+          float dt = glm::dot(planDir, glm::vec3(newDir));
+          if (dt < 0.0f)
+          {
+              newDir += glm::vec4(planDir * dt, 0.f);
+              newDir = glm::normalize(newDir);
+          }
+
+          glm::vec4 newEye = camTarget + newDir * length;
+          LookAt(&newEye.x, &camTarget.x, &referenceUp.x, view, rightHanded);
       }
 
       if (interpolationFrames)
@@ -3155,45 +3525,8 @@ namespace GUIZMO_NAMESPACE
           LookAt(&newEye.x, &camTarget.x, &newUp.x, view, rightHanded);
       }
 
-      gContext.mIsViewManipulatorHovered = gContext.mbMouseOver && Rect(position, position + size).Contains(glm::vec2(mouseX, mouseY));
-
-      if (input->getMouseButton(MouseButton::Left) && (fabsf(static_cast<float>(mouseDx)) || fabsf(static_cast<float>(mouseDy))) && isClicking)
-      {
-          isClicking = false;
-      }
-
-      if (!input->getMouseButton(MouseButton::Left))
-      {
-          if (isClicking)
-          {
-              int cx = overBox / 9;
-              int cy = (overBox - cx * 9) / 3;
-              int cz = overBox % 3;
-              interpolationDir = glm::vec4(1.f - (float)cx, 1.f - (float)cy, 1.f - (float)cz, 0.f) * handednessSign;
-              interpolationDir = glm::normalize(interpolationDir);
-
-              if (fabsf(glm::dot(interpolationDir, referenceUp)) > 1.0f - 0.01f)
-              {
-                  glm::vec4 right = viewInverse[0];
-                  if (fabsf(right.x) > fabsf(right.z)) right.z = 0.f; else right.x = 0.f;
-                  right = glm::normalize(right);
-                  interpolationUp = referenceUp;
-              }
-              else
-              {
-                  glm::vec3 right = glm::cross(glm::vec3(referenceUp), glm::vec3(interpolationDir));
-                  right = glm::normalize(right);
-                  glm::vec3 upResult = glm::cross(glm::vec3(interpolationDir), right);
-                  interpolationUp = glm::vec4(glm::normalize(upResult), 0.f);
-              }
-              interpolationFrames = 20;
-              isClicking = false;
-          }
-          isDraging = false;
-      }
-
+      // restore view/projection because it was used to compute ray
       gContext.mViewMat = svgView;
       gContext.mProjectionMat = svgProjection;
   }
-
-};
+}

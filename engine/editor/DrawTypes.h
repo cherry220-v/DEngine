@@ -13,6 +13,7 @@
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
+#include <glm/mat4x4.hpp>
 
 #define DRAW_PI 3.14159265358979323846f
 inline glm::vec4 makePoint(float x, float y, float z)

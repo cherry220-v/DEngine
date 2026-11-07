@@ -2,6 +2,7 @@
 
 #include "../DrawTypes.h"
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <format>
 #include <stdarg.h>
@@ -18,6 +19,12 @@ class IRenderDevice;
 struct DrawList;
 struct GuiWindow;
 struct RenderContext;
+
+// glm helper (was missing - the port referenced it but never defined it)
+inline glm::vec4 makeVect(float _x, float _y, float _z = 0.f, float _w = 0.f)
+{
+   return glm::vec4(_x, _y, _z, _w);
+}
 
 inline U32 ColorConvertFloat4ToU32(const Float4& in)
 {
@@ -57,6 +64,23 @@ inline WidgetID HashData(const void* data, size_t data_size, WidgetID seed = 216
     }
 
     return hash;
+}
+
+// printf-style helper writing into a caller-owned buffer. This overload
+// unambiguously matches the (buf, size, fmt, ...) call sites used by the
+// gizmo drawing code (passing those to the std::string overload would be UB).
+inline void FormatString(char* buffer, size_t bufferSize, const char* format, ...)
+{
+    if (!buffer || bufferSize == 0)
+    {
+        return;
+    }
+
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(buffer, bufferSize, format, args);
+    va_end(args);
 }
 
 inline std::string FormatString(const char* format, ...)
@@ -206,23 +230,23 @@ namespace GUIZMO_NAMESPACE
    [[deprecated("Use PushID/PopID instead.")]]
    void SetID(int id);
 
-	// ID stack/scopes
-	// Read the FAQ (docs/FAQ.md or http://deargui.org/faq) for more details about how ID are handled in dear gui.
-	// - Those questions are answered and pacted by understanding of the ID stack system:
-	//   - "Q: Why is my widget not reacting when I click on it?"
-	//   - "Q: How can I have widgets with an empty label?"
-	//   - "Q: How can I have multiple widgets with the same label?"
-	// - Short version: ID are hashes of the entire ID stack. If you are creating widgets in a loop you most likely
-	//   want to push a unique identifier (e.g. object pointer, loop index) to uniquely differentiate them.
-	// - You can also use the "Label##foobar" syntax within widget label to distinguish them from each others.
-	// - In this header file we use the "label"/"name" terminology to denote a string that will be displayed + used as an ID,
-	//   whereas "str_id" denote a string that is only used as an ID and not normally displayed.
-	void          PushID(const char* str_id);                                     // push string into the ID stack (will hash string).
-	void          PushID(const char* str_id_begin, const char* str_id_end);       // push string into the ID stack (will hash string).
-	void          PushID(const void* ptr_id);                                     // push pointer into the ID stack (will hash pointer).
-	void          PushID(int int_id);                                             // push integer into the ID stack (will hash integer).
-	void          PopID();                                                        // pop from the ID stack.
-	WidgetID       GetID(const char* str_id);                                      // calculate unique ID (hash of whole ID stack + given parameter). e.g. if you want to query into GuiStorage yourself
+        // ID stack/scopes
+        // Read the FAQ (docs/FAQ.md or http://deargui.org/faq) for more details about how ID are handled in dear gui.
+        // - Those questions are answered and pacted by understanding of the ID stack system:
+        //   - "Q: Why is my widget not reacting when I click on it?"
+        //   - "Q: How can I have widgets with an empty label?"
+        //   - "Q: How can I have multiple widgets with the same label?"
+        // - Short version: ID are hashes of the entire ID stack. If you are creating widgets in a loop you most likely
+        //   want to push a unique identifier (e.g. object pointer, loop index) to uniquely differentiate them.
+        // - You can also use the "Label##foobar" syntax within widget label to distinguish them from each others.
+        // - In this header file we use the "label"/"name" terminology to denote a string that will be displayed + used as an ID,
+        //   whereas "str_id" denote a string that is only used as an ID and not normally displayed.
+        void          PushID(const char* str_id);                                     // push string into the ID stack (will hash string).
+        void          PushID(const char* str_id_begin, const char* str_id_end);       // push string into the ID stack (will hash string).
+        void          PushID(const void* ptr_id);                                     // push pointer into the ID stack (will hash pointer).
+        void          PushID(int int_id);                                             // push integer into the ID stack (will hash integer).
+        void          PopID();                                                        // pop from the ID stack.
+        WidgetID       GetID(const char* str_id);                                      // calculate unique ID (hash of whole ID stack + given parameter). e.g. if you want to query into GuiStorage yourself
     WidgetID       GetID(const char* str_id_begin, const char* str_id_end);
     WidgetID       GetID(const void* ptr_id);
 
